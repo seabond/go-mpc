@@ -5,7 +5,7 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/chrisalmeida/go-mpc/internal/secretdo"
+	"github.com/seabond/go-mpc/internal/secretdo"
 )
 
 // lagrangeCoeff computes the Lagrange basis coefficient for party myID evaluating at x=0,

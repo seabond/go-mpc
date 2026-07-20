@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/chrisalmeida/go-mpc/dkls23"
+	"github.com/seabond/go-mpc/dkls23"
 )
 
 // SaveSetup encrypts and writes the node's SignerSetup to path.

@@ -9,7 +9,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
-	"github.com/chrisalmeida/go-mpc/internal/secretdo"
+	"github.com/seabond/go-mpc/internal/secretdo"
 )
 
 // --- πECDSA: 3-round threshold signing protocol (DKLS23 Protocol 3.6) ---

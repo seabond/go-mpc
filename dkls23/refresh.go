@@ -40,7 +40,7 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec/v2"
-	"github.com/chrisalmeida/go-mpc/internal/secretdo"
+	"github.com/seabond/go-mpc/internal/secretdo"
 	"golang.org/x/crypto/sha3"
 )
 

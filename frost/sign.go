@@ -8,7 +8,7 @@ import (
 	"sync"
 
 	"filippo.io/edwards25519"
-	"github.com/chrisalmeida/go-mpc/internal/secretdo"
+	"github.com/seabond/go-mpc/internal/secretdo"
 )
 
 // --- FROST 2-round threshold signing protocol (RFC 9591 Section 5.2) ---

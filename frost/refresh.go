@@ -26,7 +26,7 @@ import (
 	"fmt"
 
 	"filippo.io/edwards25519"
-	"github.com/chrisalmeida/go-mpc/internal/secretdo"
+	"github.com/seabond/go-mpc/internal/secretdo"
 )
 
 // RefreshRound1Output is broadcast by each party Pi in refresh round 1.

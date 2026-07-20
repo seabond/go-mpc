@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/chrisalmeida/go-mpc/frost"
+	"github.com/seabond/go-mpc/frost"
 )
 
 // SaveKeyShare encrypts and writes the node's KeyShare to path.

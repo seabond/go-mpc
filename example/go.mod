@@ -5,7 +5,7 @@ go 1.26
 require (
 	filippo.io/edwards25519 v1.2.0
 	github.com/btcsuite/btcd/btcec/v2 v2.3.6
-	github.com/chrisalmeida/go-mpc v0.0.0
+	github.com/seabond/go-mpc v0.0.0
 )
 
 require (
@@ -14,4 +14,4 @@ require (
 	golang.org/x/sys v0.42.0 // indirect
 )
 
-replace github.com/chrisalmeida/go-mpc => ../
+replace github.com/seabond/go-mpc => ../

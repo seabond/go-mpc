@@ -10,7 +10,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
-	"github.com/chrisalmeida/go-mpc/dkls23"
+	"github.com/seabond/go-mpc/dkls23"
 )
 
 // Node is a single DKLS23 party.

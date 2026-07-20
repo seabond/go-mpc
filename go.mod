@@ -1,4 +1,4 @@
-module github.com/chrisalmeida/go-mpc
+module github.com/seabond/go-mpc
 
 go 1.26
 

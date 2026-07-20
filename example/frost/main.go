@@ -27,7 +27,7 @@ import (
 	"go-mpc-example/frost/node"
 	"go-mpc-example/shared"
 
-	"github.com/chrisalmeida/go-mpc/frost"
+	"github.com/seabond/go-mpc/frost"
 )
 
 const (

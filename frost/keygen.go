@@ -8,7 +8,7 @@ import (
 	"sort"
 
 	"filippo.io/edwards25519"
-	"github.com/chrisalmeida/go-mpc/internal/secretdo"
+	"github.com/seabond/go-mpc/internal/secretdo"
 )
 
 // --- Feldman VSS Distributed Key Generation ---
