@@ -8,7 +8,7 @@ import (
 	"fmt"
 
 	"filippo.io/edwards25519"
-	"github.com/chrisalmeida/go-mpc/frost"
+	"github.com/seabond/go-mpc/frost"
 )
 
 // Node is a single FROST party.

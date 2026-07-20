@@ -8,13 +8,14 @@ Threshold signing library in Go. Implements two protocols:
 - **FROST** — Threshold Schnorr / Ed25519 ([RFC 9591](https://www.rfc-editor.org/rfc/rfc9591.html), FROST(Ed25519, SHA-512))
 
 - **Module**: `github.com/chrisalmeida/go-mpc`
-- **Go**: 1.25+
+- **Go**: 1.26+
 
 ## Build & Test
 
 ```bash
 make test          # run all tests
 make test-race     # run with race detector (what CI runs)
+make test-secret   # run with runtime/secret memory erasure (linux only)
 make bench         # run benchmarks
 make cover         # show coverage summary
 make lint          # go vet + staticcheck
@@ -25,6 +26,7 @@ Or directly:
 ```bash
 go test ./...
 go test -race -timeout 120s ./...
+GOEXPERIMENT=runtimesecret go test -race -timeout 120s ./...  # with memory erasure
 ```
 
 ## Code Layout
@@ -56,6 +58,10 @@ go test -race -timeout 120s ./...
   - `frost/` — 2-of-3 FROST Ed25519 demo (`cd example/frost && go run .`)
   - Separate `go.mod` with `replace github.com/chrisalmeida/go-mpc => ../`
   - Not included in `go test ./...` — run and test independently
+- `internal/secretdo/` — Build-tag shim for `runtime/secret` (Go 1.26 experimental).
+  - `do_experiment.go` — Calls `runtime/secret.Do` when built with `GOEXPERIMENT=runtimesecret`
+  - `do_fallback.go` — Direct call passthrough on all other builds
+  - Both `dkls23/` and `frost/` import this package to wrap all exported functions that handle secret material
 
 ## Conventions
 

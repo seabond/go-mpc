@@ -119,8 +119,13 @@ post-persistence functional round-trips, and identifiable abort.
 ## Known Limitations
 
 - **Memory retention**: Go's garbage collector may retain copies of
-  intermediate stack values after zeroization. No memory pinning or `mlock`
-  is used. (Applies to both packages.)
+  intermediate stack values after zeroization. When built with
+  `GOEXPERIMENT=runtimesecret` (Go 1.26+, linux/amd64 and linux/arm64),
+  all exported functions that handle secret material are wrapped in
+  `runtime/secret.Do`, which erases registers, stack, and heap used by
+  the function after it returns. On other platforms, the fallback is
+  direct invocation with manual `Zero()` calls (defense-in-depth).
+  (Applies to both packages.)
 - **Random oracle model**: dkls23 uses SHAKE-256; frost uses SHA-512. Both
   are modeled as random oracles in their respective protocol security proofs.
 - **Physical attacks**: No protection is provided against physical

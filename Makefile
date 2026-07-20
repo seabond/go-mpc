@@ -1,4 +1,4 @@
-.PHONY: test test-race test-verbose bench cover lint vet staticcheck ci
+.PHONY: test test-race test-secret test-verbose bench cover lint vet staticcheck ci
 
 # Run all tests
 test:
@@ -7,6 +7,10 @@ test:
 # Run tests with race detector
 test-race:
 	go test -race -timeout 120s ./...
+
+# Run tests with runtime/secret memory erasure (linux/amd64 and linux/arm64 only)
+test-secret:
+	GOEXPERIMENT=runtimesecret go test -race -timeout 120s ./...
 
 # Run tests with verbose output
 test-verbose:

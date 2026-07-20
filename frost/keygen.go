@@ -8,6 +8,7 @@ import (
 	"sort"
 
 	"filippo.io/edwards25519"
+	"github.com/seabond/go-mpc/internal/secretdo"
 )
 
 // --- Feldman VSS Distributed Key Generation ---
@@ -164,7 +165,14 @@ func lagrangeCoeff(myID int, allIDs []int) *edwards25519.Scalar {
 // Pi samples a degree-(t-1) polynomial, broadcasts Feldman commitments,
 // and commits (via hash commitment) to each other party's share.
 // Returns the round 1 output and the polynomial coefficients (needed for round 2).
-func DKGRound1(config DKGPartyConfig) (*DKGRound1Output, []*edwards25519.Scalar, error) {
+func DKGRound1(config DKGPartyConfig) (out *DKGRound1Output, coeffs []*edwards25519.Scalar, err error) {
+	secretdo.Do(func() {
+		out, coeffs, err = dkgRound1(config)
+	})
+	return
+}
+
+func dkgRound1(config DKGPartyConfig) (*DKGRound1Output, []*edwards25519.Scalar, error) {
 	if err := validatePartyIDs(config.AllIDs, "DKGRound1"); err != nil {
 		return nil, nil, err
 	}
@@ -232,7 +240,14 @@ func DKGRound1(config DKGPartyConfig) (*DKGRound1Output, []*edwards25519.Scalar,
 // DKGRound2 decommits pairwise shares after receiving round 1 messages from all parties.
 // myCoeffs are the polynomial coefficients sampled in round 1.
 // Returns the decommitments (plaintext shares) to send to each other party.
-func DKGRound2(config DKGPartyConfig, myCoeffs []*edwards25519.Scalar) (*DKGRound2Output, error) {
+func DKGRound2(config DKGPartyConfig, myCoeffs []*edwards25519.Scalar) (out *DKGRound2Output, err error) {
+	secretdo.Do(func() {
+		out, err = dkgRound2(config, myCoeffs)
+	})
+	return
+}
+
+func dkgRound2(config DKGPartyConfig, myCoeffs []*edwards25519.Scalar) (*DKGRound2Output, error) {
 	secretShares := make(map[int][]byte)
 	for _, j := range config.AllIDs {
 		if j == config.MyID {
@@ -281,6 +296,18 @@ func feldmanVerify(share *edwards25519.Scalar, x int, feldmanCommitments [][]byt
 //
 // Returns the final KeyShare or error (listing bad senders).
 func DKGFinalize(
+	config DKGPartyConfig,
+	myCoeffs []*edwards25519.Scalar,
+	allRound1 map[int]*DKGRound1Output,
+	allRound2 map[int]*DKGRound2Output,
+) (ks *KeyShare, err error) {
+	secretdo.Do(func() {
+		ks, err = dkgFinalize(config, myCoeffs, allRound1, allRound2)
+	})
+	return
+}
+
+func dkgFinalize(
 	config DKGPartyConfig,
 	myCoeffs []*edwards25519.Scalar,
 	allRound1 map[int]*DKGRound1Output,

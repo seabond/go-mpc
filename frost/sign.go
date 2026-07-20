@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"filippo.io/edwards25519"
+	"github.com/seabond/go-mpc/internal/secretdo"
 )
 
 // --- FROST 2-round threshold signing protocol (RFC 9591 Section 5.2) ---
@@ -118,7 +119,14 @@ func checkBlacklist(signer *SignerState, partyIDs []int, phase string) error {
 // against bad RNG (RFC 9591 Section 5.2, nonce_generate).
 //
 // Nonce reuse across signing sessions is fatal: it enables full key recovery.
-func SignRound1(signer *SignerState, signers []int) (*Round1State, *NonceCommitment, error) {
+func SignRound1(signer *SignerState, signers []int) (state *Round1State, com *NonceCommitment, err error) {
+	secretdo.Do(func() {
+		state, com, err = signRound1(signer, signers)
+	})
+	return
+}
+
+func signRound1(signer *SignerState, signers []int) (*Round1State, *NonceCommitment, error) {
 	signer.mu.RLock()
 	defer signer.mu.RUnlock()
 
@@ -203,7 +211,14 @@ func nonceGenerate(secret []byte) (*edwards25519.Scalar, error) {
 //  3. Compute challenge c = H2(R || PK || msg).
 //  4. Compute z_i = d_i + rho_i * e_i + lambda_i * s_i * c.
 //  5. Zeroize d_i and e_i.
-func SignRound2(signer *SignerState, state *Round1State, input *Round2Input) (*SignatureShare, error) {
+func SignRound2(signer *SignerState, r1state *Round1State, input *Round2Input) (share *SignatureShare, err error) {
+	secretdo.Do(func() {
+		share, err = signRound2(signer, r1state, input)
+	})
+	return
+}
+
+func signRound2(signer *SignerState, state *Round1State, input *Round2Input) (*SignatureShare, error) {
 	signer.mu.RLock()
 	defer signer.mu.RUnlock()
 
@@ -279,6 +294,20 @@ func SignRound2(signer *SignerState, state *Round1State, input *Round2Input) (*S
 // verificationShares maps signer ID to their verification share (s_i * B, 32 bytes).
 // If non-nil, individual shares are verified and misbehaving signers are identified.
 func Aggregate(
+	allCommitments map[int]*NonceCommitment,
+	allShares map[int]*SignatureShare,
+	message []byte,
+	groupPublicKey []byte,
+	verificationShares map[int][]byte,
+	signers []int,
+) (sig *Signature, err error) {
+	secretdo.Do(func() {
+		sig, err = aggregate(allCommitments, allShares, message, groupPublicKey, verificationShares, signers)
+	})
+	return
+}
+
+func aggregate(
 	allCommitments map[int]*NonceCommitment,
 	allShares map[int]*SignatureShare,
 	message []byte,

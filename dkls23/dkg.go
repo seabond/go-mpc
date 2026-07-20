@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/seabond/go-mpc/internal/secretdo"
 )
 
 // lagrangeCoeff computes the Lagrange basis coefficient for party myID evaluating at x=0,
@@ -117,7 +118,14 @@ func evalPoly(coeffs []btcec.ModNScalar, x uint32) btcec.ModNScalar {
 // Pi samples a degree-(t-1) polynomial, broadcasts Feldman commitments,
 // and commits (via FCom) to each other party's share.
 // Returns the round 1 output and the polynomial coefficients (needed for round 2).
-func DKGRound1(config DKGPartyConfig) (*DKGRound1Output, []btcec.ModNScalar, error) {
+func DKGRound1(config DKGPartyConfig) (out *DKGRound1Output, coeffs []btcec.ModNScalar, err error) {
+	secretdo.Do(func() {
+		out, coeffs, err = dkgRound1(config)
+	})
+	return
+}
+
+func dkgRound1(config DKGPartyConfig) (*DKGRound1Output, []btcec.ModNScalar, error) {
 	if err := validatePartyIDs(config.AllIDs, "DKGRound1"); err != nil {
 		return nil, nil, err
 	}
@@ -195,7 +203,14 @@ func DKGRound1(config DKGPartyConfig) (*DKGRound1Output, []btcec.ModNScalar, err
 // myCoeffs are the polynomial coefficients sampled in round 1.
 // theirRound1 is a map of other parties' round 1 outputs (Feldman commitments and pairwise commitments).
 // Returns the decommitments (plaintext shares) to send to each other party.
-func DKGRound2(config DKGPartyConfig, myCoeffs []btcec.ModNScalar, theirRound1 map[int]*DKGRound1Output) (*DKGRound2Output, error) {
+func DKGRound2(config DKGPartyConfig, myCoeffs []btcec.ModNScalar, theirRound1 map[int]*DKGRound1Output) (out *DKGRound2Output, err error) {
+	secretdo.Do(func() {
+		out, err = dkgRound2(config, myCoeffs, theirRound1)
+	})
+	return
+}
+
+func dkgRound2(config DKGPartyConfig, myCoeffs []btcec.ModNScalar, theirRound1 map[int]*DKGRound1Output) (*DKGRound2Output, error) {
 	secretShares := make(map[int][]byte)
 	for _, j := range config.AllIDs {
 		if j == config.MyID {
@@ -257,6 +272,18 @@ func feldmanVerify(share *btcec.ModNScalar, x int, feldmanCommitments [][]byte) 
 // Returns the final share p(myID) = sum_j pj(myID) mod q and the master public key pk.
 // Returns error (listing bad senders) if any check fails.
 func DKGFinalize(
+	config DKGPartyConfig,
+	myCoeffs []btcec.ModNScalar,
+	allRound1 map[int]*DKGRound1Output,
+	allRound2 map[int]*DKGRound2Output,
+) (share btcec.ModNScalar, publicKey []byte, err error) {
+	secretdo.Do(func() {
+		share, publicKey, err = dkgFinalize(config, myCoeffs, allRound1, allRound2)
+	})
+	return
+}
+
+func dkgFinalize(
 	config DKGPartyConfig,
 	myCoeffs []btcec.ModNScalar,
 	allRound1 map[int]*DKGRound1Output,

@@ -26,6 +26,7 @@ import (
 	"fmt"
 
 	"filippo.io/edwards25519"
+	"github.com/seabond/go-mpc/internal/secretdo"
 )
 
 // RefreshRound1Output is broadcast by each party Pi in refresh round 1.
@@ -113,7 +114,14 @@ func refreshFeldmanVerify(share *edwards25519.Scalar, x int, nonConstFeldman [][
 //
 // Returns the broadcast output, the polynomial coefficients (kept private until
 // round 2), and the seed (kept private until round 2).
-func RefreshRound1(signer *SignerState) (*RefreshRound1Output, []*edwards25519.Scalar, [16]byte, error) {
+func RefreshRound1(signer *SignerState) (out *RefreshRound1Output, coeffs []*edwards25519.Scalar, seed [16]byte, err error) {
+	secretdo.Do(func() {
+		out, coeffs, seed, err = refreshRound1(signer)
+	})
+	return
+}
+
+func refreshRound1(signer *SignerState) (*RefreshRound1Output, []*edwards25519.Scalar, [16]byte, error) {
 	signer.mu.RLock()
 	defer signer.mu.RUnlock()
 
@@ -181,7 +189,14 @@ func RefreshRound1(signer *SignerState) (*RefreshRound1Output, []*edwards25519.S
 
 // RefreshRound2 decommits pairwise evaluations and reveals the seed.
 // coeffs and mySeed must be the values returned by RefreshRound1.
-func RefreshRound2(signer *SignerState, coeffs []*edwards25519.Scalar, mySeed [16]byte) (*RefreshRound2Output, error) {
+func RefreshRound2(signer *SignerState, coeffs []*edwards25519.Scalar, mySeed [16]byte) (out *RefreshRound2Output, err error) {
+	secretdo.Do(func() {
+		out, err = refreshRound2(signer, coeffs, mySeed)
+	})
+	return
+}
+
+func refreshRound2(signer *SignerState, coeffs []*edwards25519.Scalar, mySeed [16]byte) (*RefreshRound2Output, error) {
 	signer.mu.RLock()
 	defer signer.mu.RUnlock()
 
@@ -212,6 +227,19 @@ func RefreshRound2(signer *SignerState, coeffs []*edwards25519.Scalar, mySeed [1
 // Returns an error naming all bad senders if any verification fails; state is
 // NOT modified in that case.
 func RefreshFinalize(
+	signer *SignerState,
+	coeffs []*edwards25519.Scalar,
+	mySeed [16]byte,
+	allRound1 map[int]*RefreshRound1Output,
+	allRound2 map[int]*RefreshRound2Output,
+) (err error) {
+	secretdo.Do(func() {
+		err = refreshFinalize(signer, coeffs, mySeed, allRound1, allRound2)
+	})
+	return
+}
+
+func refreshFinalize(
 	signer *SignerState,
 	coeffs []*edwards25519.Scalar,
 	mySeed [16]byte,

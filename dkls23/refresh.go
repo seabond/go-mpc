@@ -40,6 +40,7 @@ import (
 	"fmt"
 
 	"github.com/btcsuite/btcd/btcec/v2"
+	"github.com/seabond/go-mpc/internal/secretdo"
 	"golang.org/x/crypto/sha3"
 )
 
@@ -77,7 +78,14 @@ type RefreshRound2Output struct {
 //
 // Returns the broadcast output, the polynomial coefficients (kept private until
 // RefreshRound2), and the seed (kept private until RefreshRound2).
-func RefreshRound1(setup *SignerSetup) (*RefreshRound1Output, []btcec.ModNScalar, [16]byte, error) {
+func RefreshRound1(setup *SignerSetup) (out *RefreshRound1Output, coeffs []btcec.ModNScalar, seed [16]byte, err error) {
+	secretdo.Do(func() {
+		out, coeffs, seed, err = refreshRound1(setup)
+	})
+	return
+}
+
+func refreshRound1(setup *SignerSetup) (*RefreshRound1Output, []btcec.ModNScalar, [16]byte, error) {
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
 	t := setup.Threshold
@@ -147,7 +155,14 @@ func RefreshRound1(setup *SignerSetup) (*RefreshRound1Output, []btcec.ModNScalar
 
 // RefreshRound2 decommits pairwise evaluations and reveals the seed.
 // coeffs and mySeed must be the values returned by RefreshRound1.
-func RefreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byte) (*RefreshRound2Output, error) {
+func RefreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byte) (out *RefreshRound2Output, err error) {
+	secretdo.Do(func() {
+		out, err = refreshRound2(setup, coeffs, mySeed)
+	})
+	return
+}
+
+func refreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byte) (*RefreshRound2Output, error) {
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
 	secretShares := make(map[int][]byte)
@@ -182,6 +197,19 @@ func RefreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byt
 // Returns an error naming all bad senders if any verification fails; setup is
 // NOT modified in that case.
 func RefreshFinalize(
+	setup *SignerSetup,
+	coeffs []btcec.ModNScalar,
+	mySeed [16]byte,
+	allRound1 map[int]*RefreshRound1Output,
+	allRound2 map[int]*RefreshRound2Output,
+) (err error) {
+	secretdo.Do(func() {
+		err = refreshFinalize(setup, coeffs, mySeed, allRound1, allRound2)
+	})
+	return
+}
+
+func refreshFinalize(
 	setup *SignerSetup,
 	coeffs []btcec.ModNScalar,
 	mySeed [16]byte,

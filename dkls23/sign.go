@@ -9,6 +9,7 @@ import (
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/ecdsa"
+	"github.com/seabond/go-mpc/internal/secretdo"
 )
 
 // --- πECDSA: 3-round threshold signing protocol (DKLS23 Protocol 3.6) ---
@@ -70,6 +71,21 @@ type SignerSetup struct {
 //   - myCorrections: corrections I sent as Bob for the j→i direction.
 //   - myBeta: my OTE receiver input beta for the j→i direction.
 func SignSetupPairwise(
+	myID, theirID int,
+	bobSeeds0 [][]byte,
+	aliceSeeds [][]byte,
+	mySigma []bool,
+	theirCorrections [][Xi / 8]byte,
+	myCorrections [][Xi / 8]byte,
+	myBeta [Xi]bool,
+) (alice *VOLEAliceState, bob *VOLEBobState, err error) {
+	secretdo.Do(func() {
+		alice, bob, err = signSetupPairwise(myID, theirID, bobSeeds0, aliceSeeds, mySigma, theirCorrections, myCorrections, myBeta)
+	})
+	return
+}
+
+func signSetupPairwise(
 	myID, theirID int,
 	bobSeeds0 [][]byte,
 	aliceSeeds [][]byte,
@@ -153,7 +169,14 @@ func checkBlacklist(setup *SignerSetup, partyIDs []int, phase string) error {
 // Pi samples r_i, phi_i, computes R_i = r_i*G and commits to it.
 // Pi also computes its FZero zero-sharing value zeta_i.
 // The pre-shared VoleBob states are used as-is (they were set up during pairing setup).
-func SignRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, map[int]*Round1Msg, error) {
+func SignRound1(setup *SignerSetup, sigID string, signers []int) (state *Round1State, msgs map[int]*Round1Msg, err error) {
+	secretdo.Do(func() {
+		state, msgs, err = signRound1(setup, sigID, signers)
+	})
+	return
+}
+
+func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, map[int]*Round1Msg, error) {
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
 	if err := validatePartyIDs(signers, "SignRound1"); err != nil {
@@ -279,7 +302,14 @@ type Round2Msg struct {
 // SignRound2 executes round 2 of the threshold signing protocol (paper §3.6, step 2).
 // Pi decommits R_i, runs VOLE multiply with each counterparty (Pi as Alice),
 // and sends gamma, psi, and pki for round 3 verification.
-func SignRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round1Msg) (*Round2State, map[int]*Round2Msg, error) {
+func SignRound2(setup *SignerSetup, r1state *Round1State, allRound1 map[int]*Round1Msg) (r2state *Round2State, msgs map[int]*Round2Msg, err error) {
+	secretdo.Do(func() {
+		r2state, msgs, err = signRound2(setup, r1state, allRound1)
+	})
+	return
+}
+
+func signRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round1Msg) (*Round2State, map[int]*Round2Msg, error) {
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
 	if err := checkBlacklist(setup, state.Signers, "SignRound2"); err != nil {
@@ -385,7 +415,21 @@ type Round3Msg struct {
 //  5. Check 3: sum_k pk_k == master_pk
 //
 // If any check fails for party j: blacklist j and return error.
-func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRound2 map[int]*Round2Msg) (map[int]*Round3Msg, error) {
+func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRound2 map[int]*Round2Msg) (msgs map[int]*Round3Msg, err error) {
+	h := sha256.Sum256(message)
+	return SignRound3Prehashed(setup, state2, h, allRound2)
+}
+
+// SignRound3Prehashed is like SignRound3 but accepts a pre-computed 32-byte message hash.
+// Use this when the caller has already hashed the message (e.g. Ethereum's Keccak-256).
+func SignRound3Prehashed(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRound2 map[int]*Round2Msg) (msgs map[int]*Round3Msg, err error) {
+	secretdo.Do(func() {
+		msgs, err = signRound3(setup, state2, msgHash, allRound2)
+	})
+	return
+}
+
+func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRound2 map[int]*Round2Msg) (map[int]*Round3Msg, error) {
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
 	if err := checkBlacklist(setup, state2.Signers, "SignRound3"); err != nil {
@@ -588,8 +632,7 @@ func SignRound3(setup *SignerSetup, state2 *Round2State, message []byte, allRoun
 		v_i.Add(&dv)
 	}
 
-	// w_i = SHA256(message)*phi_i + rx*v_i mod q.
-	msgHash := sha256.Sum256(message)
+	// w_i = H(message)*phi_i + rx*v_i mod q.
 	var hashScalar btcec.ModNScalar
 	hashScalar.SetByteSlice(msgHash[:])
 
@@ -663,6 +706,19 @@ func ComputeRx(noncePoints map[int][]byte) (btcec.ModNScalar, error) {
 // s = sum(w_j) / sum(u_j) mod q; r = rx.
 // Verifies the signature against the master public key before returning.
 func SignCombine(setup *SignerSetup, rx *btcec.ModNScalar, myW, myU *btcec.ModNScalar, allRound3 map[int]*Round3Msg, message []byte) (r, s []byte, err error) {
+	h := sha256.Sum256(message)
+	return SignCombinePrehashed(setup, rx, myW, myU, allRound3, h)
+}
+
+// SignCombinePrehashed is like SignCombine but accepts a pre-computed 32-byte message hash.
+func SignCombinePrehashed(setup *SignerSetup, rx *btcec.ModNScalar, myW, myU *btcec.ModNScalar, allRound3 map[int]*Round3Msg, msgHash [32]byte) (r, s []byte, err error) {
+	secretdo.Do(func() {
+		r, s, err = signCombine(setup, rx, myW, myU, allRound3, msgHash)
+	})
+	return
+}
+
+func signCombine(setup *SignerSetup, rx *btcec.ModNScalar, myW, myU *btcec.ModNScalar, allRound3 map[int]*Round3Msg, msgHash [32]byte) (r, s []byte, err error) {
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
 
@@ -701,8 +757,6 @@ func SignCombine(setup *SignerSetup, rx *btcec.ModNScalar, myW, myU *btcec.ModNS
 	if err2 != nil {
 		return nil, nil, fmt.Errorf("dkls23 SignCombine: parse pubkey: %w", err2)
 	}
-	msgHash := sha256.Sum256(message)
-
 	var rScalar, sScalar btcec.ModNScalar
 	rScalar.SetByteSlice(rBytes)
 	sScalar.SetByteSlice(sBytes)
