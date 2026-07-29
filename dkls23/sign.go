@@ -729,6 +729,17 @@ func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRo
 		}
 		pkjPoints[j] = pkj
 
+		// A relay can strip vole_msg from an otherwise genuine round 2 message and
+		// the round 1 commitment will not notice: it covers R_j and psi, not this.
+		// A missing multiply message is a party failing to play its part, which is
+		// what the blacklist is for — it must not be a nil dereference that takes
+		// the node down instead.
+		if r2j.VoleMsg == nil {
+			badParties = append(badParties, j)
+			setup.Blacklist[j] = true
+			continue
+		}
+
 		// Step 2: VOLE Bob receive. Pi is Bob in the j→i VOLE direction.
 		bobState := state2.VoleBobForRound2[j]
 		if bobState == nil {
