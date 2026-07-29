@@ -557,8 +557,9 @@ type round1StateJSON struct {
 	RI               string                   `json:"r_i"`
 	PhiI             string                   `json:"phi_i"`
 	RIPoint          string                   `json:"r_i_point"`
-	Com              string                   `json:"com"`
+	Com              map[string]string        `json:"com"`
 	Salt             string                   `json:"salt"`
+	Psi              map[string]string        `json:"psi"`
 	ZetaI            string                   `json:"zeta_i"`
 	VoleBobForRound2 map[string]*VOLEBobState `json:"vole_bob_for_round2"`
 }
@@ -570,8 +571,9 @@ func (s *Round1State) MarshalJSON() ([]byte, error) {
 		RI:               scalarToHex(&s.R_i),
 		PhiI:             scalarToHex(&s.Phi_i),
 		RIPoint:          hex.EncodeToString(s.R_iPoint),
-		Com:              hex.EncodeToString(s.Com[:]),
+		Com:              intMap32ToJSON(s.Com),
 		Salt:             hex.EncodeToString(s.Salt[:]),
+		Psi:              intMap32ToJSON(s.Psi),
 		ZetaI:            scalarToHex(&s.ZetaI),
 		VoleBobForRound2: intMapKeys(s.VoleBobForRound2),
 	})
@@ -597,11 +599,15 @@ func (s *Round1State) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	s.Com, err = hexToFixed32(j.Com)
+	s.Com, err = jsonToIntMap32(j.Com)
 	if err != nil {
 		return err
 	}
 	s.Salt, err = hexToFixed32(j.Salt)
+	if err != nil {
+		return err
+	}
+	s.Psi, err = jsonToIntMap32(j.Psi)
 	if err != nil {
 		return err
 	}
@@ -623,6 +629,10 @@ type round2StateJSON struct {
 	CU            map[string]string `json:"c_u"`
 	CV            map[string]string `json:"c_v"`
 	Round1Commits map[string]string `json:"round1_commits"`
+	// Round3Done carries the single-use marker across serialization. Dropping it
+	// would let a snapshot-and-restore replay round 3 against a spent state, which
+	// is the key-recovery break signRound3 refuses.
+	Round3Done bool `json:"round3_done"`
 }
 
 func (s *Round2State) MarshalJSON() ([]byte, error) {
@@ -632,6 +642,7 @@ func (s *Round2State) MarshalJSON() ([]byte, error) {
 		CU:            scalarMapToHex(s.C_u),
 		CV:            scalarMapToHex(s.C_v),
 		Round1Commits: intMap32ToJSON(s.Round1Commits),
+		Round3Done:    s.round3Done.Load(),
 	})
 }
 
@@ -655,6 +666,7 @@ func (s *Round2State) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	s.Round1Commits, err = jsonToIntMap32(j.Round1Commits)
+	s.round3Done.Store(j.Round3Done)
 	return err
 }
 

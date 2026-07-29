@@ -211,10 +211,16 @@ type Round1State struct {
 	Phi_i btcec.ModNScalar
 	// R_iPoint is R_i*G (33-byte compressed).
 	R_iPoint []byte
-	// Com is FCom commitment to R_iPoint.
-	Com [32]byte
-	// Salt is the FCom salt for Com.
+	// Com[j] is the FCom commitment Pi sends to Pj, over R_iPoint || Psi[j]. It is
+	// keyed by counterparty because psi is pairwise; see signRound1 for why psi is
+	// inside the commitment at all.
+	Com map[int][32]byte
+	// Salt is the FCom salt, shared by every entry of Com.
 	Salt [SaltLen]byte
+	// Psi[j] is psi_{i,j} = phi_i - chi_{j->i} mod q, the value round 2 sends to
+	// Pj. It is fixed here in round 1 — both inputs are round-1 quantities — which
+	// is what makes it committable before it is ever sent.
+	Psi map[int][32]byte
 	// ZetaI is Pi's FZero zero-sharing value for this session.
 	ZetaI btcec.ModNScalar
 	// VoleBobForRound2 holds Pi's VOLE Bob state per counterparty j (Pi is Bob, j is Alice).
@@ -306,10 +312,13 @@ func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 		return nil, nil, fmt.Errorf("dkls23 SignRound1: R_i: %w", err)
 	}
 
-	// Commit to R_i.
-	com, salt, err := Commit(R_iPoint)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 SignRound1: commit: %w", err)
+	// One FCom salt for every per-counterparty commitment below. The commitments
+	// differ (each covers that pair's psi) but round 2 carries a single salt, and
+	// hiding comes from the salt's entropy rather than from a fresh salt per
+	// message.
+	var salt [SaltLen]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		return nil, nil, fmt.Errorf("dkls23 SignRound1: salt: %w", err)
 	}
 
 	// FZero sample: restrict seeds to this signing session's counterparties.
@@ -332,6 +341,8 @@ func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 	// This rides on round 1, which already sends a message to every counterparty, so
 	// per-session freshness costs no extra round trip.
 	bobStates := make(map[int]*VOLEBobState)
+	psis := make(map[int][32]byte)
+	coms := make(map[int][32]byte)
 	outMsgs := make(map[int]*Round1Msg)
 	for _, j := range signers {
 		if j == setup.MyID {
@@ -349,6 +360,26 @@ func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 			return nil, nil, fmt.Errorf("dkls23 SignRound1: fresh VOLE Bob for %d: %w", j, err)
 		}
 		bobStates[j] = bob
+
+		// psi_{i,j} = phi_i - chi_{j->i} mod q is already determined: phi_i was
+		// sampled above and chi comes out of Pi's own Bob state. Commit to it here,
+		// alongside R_i, so that the value round 2 puts on the wire is BOUND before
+		// anything from another party has been seen.
+		//
+		// Without that binding psi is just attacker-chosen bytes by the time round 3
+		// folds it into eff_phi, and round 3 becomes an oracle: run it twice with
+		// psi and psi', and (u_i - u_i')/(psi - psi') = r_i while
+		// (w_i - w_i')/(psi - psi') = rx*sk_i. That recovers the party's
+		// rerandomized share, and summed over the signers, the group private key.
+		// A relay that holds no share at all can do it.
+		var negChi, psi btcec.ModNScalar
+		negChi.NegateVal(&bob.Chi)
+		psi.Add2(&phi_i, &negChi)
+		psiArr := psi.Bytes()
+		psis[j] = psiArr
+
+		com := commitWithSalt(commitMsgForPeer(R_iPoint, psiArr[:]), salt)
+		coms[j] = com
 		outMsgs[j] = &Round1Msg{Commitment: com, OTECorrections: corrections}
 	}
 
@@ -358,17 +389,45 @@ func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 		R_i:              r_i,
 		Phi_i:            phi_i,
 		R_iPoint:         R_iPoint,
-		Com:              com,
+		Com:              coms,
 		Salt:             salt,
+		Psi:              psis,
 		ZetaI:            zetaI,
 		VoleBobForRound2: bobStates,
 	}
 	return state, outMsgs, nil
 }
 
+// Round-1 commitment message widths. They are enforced before Open because a
+// hash over a concatenation only binds the pair if the split is unambiguous:
+// unchecked, a peer could move bytes across the boundary and open the same
+// commitment to a different (R_j, psi) pair, which is the whole point of the
+// commitment.
+const (
+	compressedPointLen = 33
+	psiLen             = 32
+)
+
+// commitMsgForPeer is the byte string Pi commits to in round 1 for one
+// counterparty: its nonce point followed by that pair's psi.
+func commitMsgForPeer(rPoint, psi []byte) []byte {
+	msg := make([]byte, 0, len(rPoint)+len(psi))
+	msg = append(msg, rPoint...)
+	msg = append(msg, psi...)
+	return msg
+}
+
 // Round2State holds Pi's private state after signing round 2.
+//
+// It is SINGLE-USE: exactly one SignRound3 may consume it. See signRound3 for
+// what a second one hands the caller. A Round2State must not be copied after
+// first use.
 type Round2State struct {
 	*Round1State
+	// round3Done marks the state spent. Unexported so no caller can clear it, but
+	// carried through the JSON encoding so a state that is persisted and restored
+	// stays spent — a rollback must not resurrect a used one.
+	round3Done atomic.Bool
 	// SK_i is Pi's rerandomized Shamir share: share*lagrange(signers,myID,0) + zeta_i mod q.
 	SK_i btcec.ModNScalar
 	// C_u[j] is Pi's VOLE Alice output share for the nonce correlation with Pj.
@@ -393,6 +452,10 @@ type Round2Msg struct {
 	GammaV []byte
 	// Psi = phi_i - chi_{j->i} mod q (32 bytes big-endian); used for inversion.
 	// chi_{j->i} is the VOLE Bob chi where Pi is Bob and Pj is Alice.
+	//
+	// It is covered by the round 1 commitment together with Decommitment, so the
+	// recipient verifies it rather than trusting it. It reaches round 3 through
+	// whatever relays the ceremony, and round 3 folds it straight into eff_phi.
 	Psi []byte
 	// PKi = sk_i*G (compressed 33 bytes); for public key consistency check.
 	PKi []byte
@@ -482,18 +545,16 @@ func signRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 			return nil, nil, fmt.Errorf("dkls23 SignRound2: GammaV for %d: %w", j, err)
 		}
 
-		// psi_{i,j} = phi_i - chi_{j->i} mod q.
-		// chi_{j->i} is from the VOLE Bob state where Pi is Bob and j is Alice.
-		bobStateJI := state.VoleBobForRound2[j]
-		if bobStateJI == nil {
+		// psi_{i,j} was fixed and committed to in round 1. Sending the stored value
+		// rather than recomputing it is what makes "what was committed" and "what
+		// was sent" the same object by construction.
+		psiArr, ok := state.Psi[j]
+		if !ok {
+			return nil, nil, &CorruptStateError{Phase: "SignRound2", Detail: fmt.Sprintf("missing psi for party %d", j)}
+		}
+		if state.VoleBobForRound2[j] == nil {
 			return nil, nil, &CorruptStateError{Phase: "SignRound2", Detail: fmt.Sprintf("missing VOLE Bob state for party %d", j)}
 		}
-		chiJI := bobStateJI.Chi
-		var psi btcec.ModNScalar
-		var negChi btcec.ModNScalar
-		negChi.NegateVal(&chiJI)
-		psi.Add2(&state.Phi_i, &negChi)
-		psiArr := psi.Bytes()
 
 		outMsgs[j] = &Round2Msg{
 			Decommitment: state.R_iPoint,
@@ -550,6 +611,23 @@ func SignRound3Prehashed(setup *SignerSetup, state2 *Round2State, msgHash [32]by
 }
 
 func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRound2 map[int]*Round2Msg) (map[int]*Round3Msg, error) {
+	// Round 3 is single-shot per Round2State. A second run is a key-recovery
+	// break, not a protocol nuisance: eff_phi folds in the counterparties' psi
+	// values, so a caller that runs round 3 twice with psi and then psi' gets
+	// (u_i - u_i')/(psi - psi') = r_i and (w_i - w_i')/(psi - psi') = rx*sk_i.
+	// That is this party's nonce and its rerandomized share; summed over the
+	// signers it is the group private key.
+	//
+	// Marked spent on ENTRY, before any check that could fail, so a rejected
+	// attempt buys no retry. The fragments are what must never exist twice for one
+	// nonce, and a caller that wants another signature must run a new session.
+	if !state2.round3Done.CompareAndSwap(false, true) {
+		return nil, &InvalidInputError{
+			Phase:  "SignRound3",
+			Detail: fmt.Sprintf("round 3 already ran for session %q: a Round2State is single-use", state2.SigID),
+		}
+	}
+
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
 	if err := checkBlacklist(setup, state2.Signers, "SignRound3"); err != nil {
@@ -591,9 +669,20 @@ func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRo
 			continue
 		}
 
-		// Step 1: Verify FCom decommitment of R_j.
+		// Step 1: Verify the FCom decommitment of R_j AND of psi_{j,i}, which round 1
+		// committed to as one message. psi is otherwise unauthenticated bytes that a
+		// relay can rewrite on their way here, and eff_phi below adds them in
+		// unconditionally; opening them against the round 1 commitment is what turns
+		// a rewrite into an abort instead of a silently different signature.
+		//
+		// The widths are checked first so the concatenation cannot be re-split.
+		if len(r2j.Decommitment) != compressedPointLen || len(r2j.Psi) != psiLen {
+			badParties = append(badParties, j)
+			setup.Blacklist[j] = true
+			continue
+		}
 		comJ := state2.Round1Commits[j]
-		if err := Open(r2j.Decommitment, comJ, r2j.Salt); err != nil {
+		if err := Open(commitMsgForPeer(r2j.Decommitment, r2j.Psi), comJ, r2j.Salt); err != nil {
 			badParties = append(badParties, j)
 			setup.Blacklist[j] = true
 			continue
@@ -714,6 +803,9 @@ func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRo
 	rx.SetByteSlice(rxBytes)
 
 	// eff_phi_i = phi_i + sum_{j∈signers, j≠i} psi_{j,i}
+	//
+	// Every psi added here has been opened against j's round 1 commitment above, so
+	// this is j's committed value and not whatever arrived on the wire.
 	var effPhi btcec.ModNScalar
 	effPhi.Set(&state2.Phi_i)
 	for _, j := range state2.Signers {
@@ -722,7 +814,12 @@ func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRo
 		}
 		r2j := allRound2[j]
 		var psiJI btcec.ModNScalar
-		psiJI.SetByteSlice(r2j.Psi)
+		if psiJI.SetByteSlice(r2j.Psi) {
+			// Honest psi is q-reduced by construction, so an overflowing one means the
+			// committer chose a non-canonical encoding. Reducing it silently would let
+			// two encodings satisfy one commitment.
+			return nil, &CheatingPartyError{PartyIDs: []int{j}, Phase: "SignRound3", Detail: "psi is not a canonical scalar"}
+		}
 		effPhi.Add(&psiJI)
 	}
 
