@@ -511,6 +511,12 @@ func (m *VOLEMultiplyMsg) UnmarshalJSON(data []byte) error {
 type round1MsgJSON struct {
 	Commitment     string   `json:"commitment"`
 	OTECorrections []string `json:"ote_corrections"`
+	// The OT-extension consistency proof travels WITH the corrections it
+	// authorizes. Omitting it here decoded to a zero proof, which fails
+	// verification — so a message that survived this encoding was a message the
+	// recipient then refused, and the corrections it carried were unusable.
+	OTECheckT string `json:"ote_check_t"`
+	OTECheckX string `json:"ote_check_x"`
 }
 
 func (m *Round1Msg) MarshalJSON() ([]byte, error) {
@@ -521,6 +527,8 @@ func (m *Round1Msg) MarshalJSON() ([]byte, error) {
 	return json.Marshal(round1MsgJSON{
 		Commitment:     hex.EncodeToString(m.Commitment[:]),
 		OTECorrections: corrs,
+		OTECheckT:      hex.EncodeToString(m.OTECheckT[:]),
+		OTECheckX:      hex.EncodeToString(m.OTECheckX[:]),
 	})
 }
 
@@ -543,6 +551,16 @@ func (m *Round1Msg) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("Round1Msg.OTECorrections[%d]: got %d bytes, want %d", i, len(b), Xi/8)
 		}
 		copy(m.OTECorrections[i][:], b)
+	}
+	// Refused rather than defaulted. A zero proof is not a missing field, it is a
+	// proof that will fail verification, and decoding to one turns "this message
+	// predates the consistency check" into "this peer sent corrections it cannot
+	// justify" — which is the correct conclusion, but reached far too late.
+	if m.OTECheckT, err = hexToFixed16(j.OTECheckT); err != nil {
+		return fmt.Errorf("Round1Msg.OTECheckT: %w", err)
+	}
+	if m.OTECheckX, err = hexToFixed16(j.OTECheckX); err != nil {
+		return fmt.Errorf("Round1Msg.OTECheckX: %w", err)
 	}
 	return nil
 }

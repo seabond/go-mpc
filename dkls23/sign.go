@@ -275,6 +275,30 @@ func checkBlacklist(setup *SignerSetup, partyIDs []int, phase string) error {
 // reusable base OT, and publishes the resulting OTE corrections in its round 1
 // message. The correlation is never carried over from a previous session; see
 // BaseOTMaterial for what goes wrong when it is.
+//
+// THE CALLER MUST NEVER REPEAT A sigID FOR A GIVEN SETUP. This is not hygiene,
+// and this function cannot enforce it.
+//
+// sigID is the only input that makes the OT-extension pads fresh: they are
+// prg(voleSIDForPair(sigID, ...), base-OT seed), and the base OT is reused with
+// a peer by design. Two sessions under one sigID therefore share pads at every
+// index where the freshly sampled beta agrees — half of them — and the
+// counterparty, which chose both betas, knows exactly which. Subtracting the two
+// aTilde matrices cancels the pads and yields the difference of this party's
+// nonce shares; two ECDSA signatures with a known nonce difference give up the
+// private key. TestReusingASigIDLeaksTheNonceDifference demonstrates it.
+//
+// Enforcement has to be durable and therefore belongs to the caller. A
+// SignerSetup is unsealed fresh per call from storage, so an in-memory guard on
+// it can never fire, and a process restart would clear one while leaving the
+// share on disk exactly as it was. Making sigID contributory instead would need
+// both parties' fresh nonces before the corrections are built — but the
+// corrections ARE round 1, so Bob computes his before Alice's round 1 arrives.
+// That is a protocol restructure, not a check.
+//
+// A caller holding real funds should record every sigID it has used, per setup,
+// permanently, in the same transaction that consumes it. See the vault's
+// claimSigID for one that does.
 func SignRound1(setup *SignerSetup, sigID string, signers []int) (state *Round1State, msgs map[int]*Round1Msg, err error) {
 	secretdo.Do(func() {
 		state, msgs, err = signRound1(setup, sigID, signers)
