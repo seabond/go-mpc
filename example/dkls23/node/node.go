@@ -86,8 +86,7 @@ func (n *Node) DKGFinalize(
 		Share:      share,
 		PubKey:     pk,
 		Threshold:  n.Threshold,
-		VoleAlice:  make(map[int]*dkls23.VOLEAliceState),
-		VoleBob:    make(map[int]*dkls23.VOLEBobState),
+		BaseOT:     make(map[int]*dkls23.BaseOTMaterial),
 		FZeroSeeds: make(map[int][16]byte),
 		Blacklist:  make(map[int]bool),
 	}
@@ -106,78 +105,67 @@ func (n *Node) PublicKey() []byte {
 
 // ── Pairwise Setup ──────────────────────────────────────────────
 
-// SetupPairwiseWith establishes VOLE and FZero state between two nodes.
+// SetupPairwiseWith establishes base OT and FZero state between two nodes.
 // Must be called after DKGFinalize on both sides.
+//
+// Note what is NOT set up here: the VOLE correlations. They are derived fresh
+// inside every signing session from this base OT, because one correlation reused
+// across sessions lets either party solve for the other's Shamir share from three
+// transcripts.
 func (n *Node) SetupPairwiseWith(peer *Node) error {
-	if err := n.setupVOLEPair(peer); err != nil {
+	if err := n.setupBaseOTPair(peer); err != nil {
 		return err
 	}
 	return n.setupFZeroPair(peer)
 }
 
-func (n *Node) setupVOLEPair(peer *Node) error {
-	// Direction: n → peer (n is Alice, peer is Bob)
-	aliceAB, bobAB, err := setupVOLEOneDirection()
+func (n *Node) setupBaseOTPair(peer *Node) error {
+	// Direction: n → peer (n is VOLE Alice, peer is VOLE Bob)
+	npBob0, npBob1, npAlice, npSigma, err := setupBaseOTOneDirection()
 	if err != nil {
-		return fmt.Errorf("VOLE %d→%d: %w", n.ID, peer.ID, err)
+		return fmt.Errorf("base OT %d→%d: %w", n.ID, peer.ID, err)
 	}
-	n.Setup.VoleAlice[peer.ID] = aliceAB
-	peer.Setup.VoleBob[n.ID] = bobAB
-
-	// Direction: peer → n (peer is Alice, n is Bob)
-	aliceBA, bobBA, err := setupVOLEOneDirection()
+	// Direction: peer → n (peer is VOLE Alice, n is VOLE Bob)
+	pnBob0, pnBob1, pnAlice, pnSigma, err := setupBaseOTOneDirection()
 	if err != nil {
-		return fmt.Errorf("VOLE %d→%d: %w", peer.ID, n.ID, err)
+		return fmt.Errorf("base OT %d→%d: %w", peer.ID, n.ID, err)
 	}
-	peer.Setup.VoleAlice[n.ID] = aliceBA
-	n.Setup.VoleBob[peer.ID] = bobBA
 
+	// Each side keeps its Bob half of the direction where it is Bob, and its
+	// Alice half of the direction where it is Alice.
+	matN, err := dkls23.NewBaseOTMaterial(pnBob0, pnBob1, npAlice, npSigma)
+	if err != nil {
+		return fmt.Errorf("base OT material for node %d: %w", n.ID, err)
+	}
+	matP, err := dkls23.NewBaseOTMaterial(npBob0, npBob1, pnAlice, pnSigma)
+	if err != nil {
+		return fmt.Errorf("base OT material for node %d: %w", peer.ID, err)
+	}
+	n.Setup.BaseOT[peer.ID] = matN
+	peer.Setup.BaseOT[n.ID] = matP
 	return nil
 }
 
-// setupVOLEOneDirection runs the full base OT → OT extension → VOLE flow
-// and returns the Alice and Bob states.
-func setupVOLEOneDirection() (*dkls23.VOLEAliceState, *dkls23.VOLEBobState, error) {
-	// Base OT
+// setupBaseOTOneDirection runs one directed base OT and returns both halves.
+//
+// Mind IKNP's role reversal: the base-OT SENDER's seed pairs are what the OTE
+// RECEIVER — VOLE Bob, the side holding beta — needs, and the base-OT RECEIVER's
+// seeds and choice bits are what VOLE Alice needs.
+func setupBaseOTOneDirection() (bobSeeds0, bobSeeds1, aliceSeeds [][]byte, sigma []bool, err error) {
 	senderPriv, senderPub, err := dkls23.BaseSenderRound1(dkls23.LambdaC)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	sigma := randomBools(dkls23.LambdaC)
-	resp, recvSeeds, err := dkls23.BaseReceiverRound1(senderPub, sigma)
+	sigma = randomBools(dkls23.LambdaC)
+	resp, aliceSeeds, err := dkls23.BaseReceiverRound1(senderPub, sigma)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	s0, s1, err := dkls23.BaseSenderFinalize(senderPriv, senderPub, resp)
+	bobSeeds0, bobSeeds1, err = dkls23.BaseSenderFinalize(senderPriv, senderPub, resp)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-
-	// OT Extension
-	beta := randomBetaXi()
-	corr, err := dkls23.OTExtReceiverCorrections(s0, s1, beta)
-	if err != nil {
-		return nil, nil, err
-	}
-	a0, a1, err := dkls23.OTExtSenderExpand(recvSeeds, sigma, corr)
-	if err != nil {
-		return nil, nil, err
-	}
-	gam, err := dkls23.OTExtReceiverExpand(s0, beta, corr)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	// VOLE
-	alice, err := dkls23.VOLEAliceSetup(a0, a1)
-	if err != nil {
-		return nil, nil, err
-	}
-	bob, err := dkls23.VOLEBobSample(gam, beta)
-	if err != nil {
-		return nil, nil, err
-	}
-	return alice, bob, nil
+	return bobSeeds0, bobSeeds1, aliceSeeds, sigma, nil
 }
 
 func (n *Node) setupFZeroPair(peer *Node) error {
@@ -309,14 +297,3 @@ func randomBools(n int) []bool {
 	return out
 }
 
-func randomBetaXi() [dkls23.Xi]bool {
-	buf := make([]byte, (dkls23.Xi+7)/8)
-	if _, err := rand.Read(buf); err != nil {
-		panic(err)
-	}
-	var beta [dkls23.Xi]bool
-	for j := 0; j < dkls23.Xi; j++ {
-		beta[j] = (buf[j/8]>>(uint(j)%8))&1 == 1
-	}
-	return beta
-}
