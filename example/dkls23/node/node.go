@@ -296,4 +296,3 @@ func randomBools(n int) []bool {
 	}
 	return out
 }
-
