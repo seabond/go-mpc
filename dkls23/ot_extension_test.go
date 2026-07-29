@@ -41,15 +41,15 @@ func TestOTExtension(t *testing.T) {
 	}
 
 	// Step 3: Bob computes corrections and sends to Alice.
-	corrections, err := OTExtReceiverCorrections(bobSeeds0, bobSeeds1, beta)
+	corrections, err := OTExtReceiverCorrections(testSID, bobSeeds0, bobSeeds1, beta)
 	require.NoError(t, err)
 
 	// Step 4: Alice expands sender OTE output.
-	alpha0, alpha1, err := OTExtSenderExpand(aliceSeeds, sigma, corrections)
+	alpha0, alpha1, err := OTExtSenderExpand(testSID, aliceSeeds, sigma, corrections)
 	require.NoError(t, err)
 
 	// Step 5: Bob expands receiver OTE output.
-	gamma, err := OTExtReceiverExpand(bobSeeds0, beta, corrections)
+	gamma, err := OTExtReceiverExpand(testSID, bobSeeds0, beta, corrections)
 	require.NoError(t, err)
 
 	// Verify OTE correctness: gamma[j][i] == alpha{beta[j]}[j][i] for all j, i.

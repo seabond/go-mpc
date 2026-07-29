@@ -265,13 +265,13 @@ func TestNewBaseOTMaterial(t *testing.T) {
 
 	// The material must be usable to derive matching single-use VOLE states: Bob
 	// draws a fresh beta and publishes corrections, Alice expands against them.
-	bob, corrections, err := freshBobForSession(m)
+	bob, corrections, err := freshBobForSession(testSID, m)
 	require.NoError(t, err)
 	require.Equal(t, LambdaC, len(corrections))
 	require.False(t, bob.Chi.IsZero(), "bob chi should be initialized")
 	require.Equal(t, Xi, len(bob.Gamma))
 
-	alice, err := freshAliceForSession(m, corrections)
+	alice, err := freshAliceForSession(testSID, m, corrections)
 	require.NoError(t, err)
 	require.Equal(t, Xi, len(alice.Alpha0))
 }

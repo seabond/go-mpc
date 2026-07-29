@@ -116,16 +116,25 @@ func sampleBeta() (beta [Xi]bool, err error) {
 
 // freshBobForSession derives a single-use VOLE Bob state, plus the OTE corrections
 // that must be handed to the counterparty so it can derive the matching Alice state.
-func freshBobForSession(m *BaseOTMaterial) (*VOLEBobState, [][Xi / 8]byte, error) {
+//
+// sid is the DIRECTED-pair session id for the direction in which this party is
+// Bob. It must equal the sid the counterparty uses as Alice for the same
+// direction, or the correlation will not cancel. Both sides derive it from
+// voleSIDForPair, so they agree by construction.
+//
+// Passing sid is not bookkeeping: without it the OT extension expands a fixed
+// base-OT seed to a fixed pad, and a fresh beta only re-selects among those
+// fixed pads. See prg in ot_extension.go for what that costs.
+func freshBobForSession(sid string, m *BaseOTMaterial) (*VOLEBobState, [][Xi / 8]byte, error) {
 	beta, err := sampleBeta()
 	if err != nil {
 		return nil, nil, err
 	}
-	corrections, err := OTExtReceiverCorrections(m.BobSeeds0, m.BobSeeds1, beta)
+	corrections, err := OTExtReceiverCorrections(sid, m.BobSeeds0, m.BobSeeds1, beta)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dkls23 freshBobForSession: corrections: %w", err)
 	}
-	gamma, err := OTExtReceiverExpand(m.BobSeeds0, beta, corrections)
+	gamma, err := OTExtReceiverExpand(sid, m.BobSeeds0, beta, corrections)
 	if err != nil {
 		return nil, nil, fmt.Errorf("dkls23 freshBobForSession: expand: %w", err)
 	}
@@ -138,8 +147,8 @@ func freshBobForSession(m *BaseOTMaterial) (*VOLEBobState, [][Xi / 8]byte, error
 
 // freshAliceForSession derives a single-use VOLE Alice state from the corrections the
 // counterparty produced as Bob for this session.
-func freshAliceForSession(m *BaseOTMaterial, theirCorrections [][Xi / 8]byte) (*VOLEAliceState, error) {
-	alpha0, alpha1, err := OTExtSenderExpand(m.AliceSeeds, m.Sigma, theirCorrections)
+func freshAliceForSession(sid string, m *BaseOTMaterial, theirCorrections [][Xi / 8]byte) (*VOLEAliceState, error) {
+	alpha0, alpha1, err := OTExtSenderExpand(sid, m.AliceSeeds, m.Sigma, theirCorrections)
 	if err != nil {
 		return nil, fmt.Errorf("dkls23 freshAliceForSession: expand: %w", err)
 	}
@@ -335,7 +344,7 @@ func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 				Detail: fmt.Sprintf("missing base OT material for party %d", j),
 			}
 		}
-		bob, corrections, err := freshBobForSession(material)
+		bob, corrections, err := freshBobForSession(voleSIDForPair(sigID, j, setup.MyID), material)
 		if err != nil {
 			return nil, nil, fmt.Errorf("dkls23 SignRound1: fresh VOLE Bob for %d: %w", j, err)
 		}
@@ -451,7 +460,7 @@ func signRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 				Detail: fmt.Sprintf("party %d sent %d OTE correction vectors, want %d", j, len(msg1.OTECorrections), LambdaC),
 			}
 		}
-		aliceState, err := freshAliceForSession(material, msg1.OTECorrections)
+		aliceState, err := freshAliceForSession(voleSIDForPair(state.SigID, setup.MyID, j), material, msg1.OTECorrections)
 		if err != nil {
 			return nil, nil, fmt.Errorf("dkls23 SignRound2: fresh VOLE Alice for %d: %w", j, err)
 		}

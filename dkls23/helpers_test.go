@@ -344,17 +344,17 @@ func runVOLEPairwise() (*VOLEAliceState, *VOLEBobState, error) {
 		beta[j] = (betaBytes[j/8]>>(uint(j)%8))&1 == 1
 	}
 
-	corrections, err := OTExtReceiverCorrections(bobSeeds0, bobSeeds1, beta)
+	corrections, err := OTExtReceiverCorrections(testSID, bobSeeds0, bobSeeds1, beta)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	alpha0, alpha1, err := OTExtSenderExpand(aliceSeeds, sigma, corrections)
+	alpha0, alpha1, err := OTExtSenderExpand(testSID, aliceSeeds, sigma, corrections)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	gamma, err := OTExtReceiverExpand(bobSeeds0, beta, corrections)
+	gamma, err := OTExtReceiverExpand(testSID, bobSeeds0, beta, corrections)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -371,3 +371,8 @@ func runVOLEPairwise() (*VOLEAliceState, *VOLEBobState, error) {
 
 	return aliceState, bobState, nil
 }
+
+// testSID stands in for a signing session's directed-pair id. Production derives
+// it from voleSIDForPair; tests that exercise the OT extension in isolation only
+// need both sides to agree on the same string.
+const testSID = "test-session:vole:1->2"
