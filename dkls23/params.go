@@ -63,6 +63,7 @@ const (
 	domainOTEPRG       = "ote-prg"
 	domainOTESeed      = "ote-seed"
 	domainOTEExpand    = "ote-expand"
+	domainOTECheck     = "ote-check"
 	domainVOLEFS       = "vole-fs"
 	domainVOLEProof    = "vole-proof"
 	domainVOLERefresh  = "vole-refresh"

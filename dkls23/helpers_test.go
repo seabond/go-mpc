@@ -344,12 +344,12 @@ func runVOLEPairwise() (*VOLEAliceState, *VOLEBobState, error) {
 		beta[j] = (betaBytes[j/8]>>(uint(j)%8))&1 == 1
 	}
 
-	corrections, err := OTExtReceiverCorrections(testSID, bobSeeds0, bobSeeds1, beta)
+	corrections, correctionsProof, err := OTExtReceiverCorrections(testSID, bobSeeds0, bobSeeds1, beta)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	alpha0, alpha1, err := OTExtSenderExpand(testSID, aliceSeeds, sigma, corrections)
+	alpha0, alpha1, err := OTExtSenderExpand(testSID, aliceSeeds, sigma, corrections, correctionsProof)
 	if err != nil {
 		return nil, nil, err
 	}

@@ -244,7 +244,10 @@ func TestNewBaseOTMaterial(t *testing.T) {
 	mySigma := randomBools(t, LambdaC)
 	responses, aliceSeeds, err := BaseReceiverRound1(jPub, mySigma)
 	require.NoError(t, err)
-	_, _, err = BaseSenderFinalize(jPriv, jPub, responses)
+	// j's matching Bob half for THIS direction. i's Alice half pairs with this,
+	// not with i's own Bob half — those come from the other direction's base OT
+	// and share no seeds at all.
+	jBob0, jBob1, err := BaseSenderFinalize(jPriv, jPub, responses)
 	require.NoError(t, err)
 
 	// Direction j→i: i is base-OT sender, so i becomes VOLE Bob.
@@ -265,13 +268,21 @@ func TestNewBaseOTMaterial(t *testing.T) {
 
 	// The material must be usable to derive matching single-use VOLE states: Bob
 	// draws a fresh beta and publishes corrections, Alice expands against them.
-	bob, corrections, err := freshBobForSession(testSID, m)
+	//
+	// The two halves are paired ACROSS parties, which is the only pairing that
+	// exists in the protocol. Running Bob and Alice off one party's own material
+	// would pair two unrelated base OTs; it used to look like it worked because
+	// nothing checked the correlation, and the consistency check now refuses it.
+	jMaterial, err := NewBaseOTMaterial(jBob0, jBob1, aliceSeeds, mySigma)
+	require.NoError(t, err)
+
+	bob, corrections, oteProof, err := freshBobForSession(testSID, jMaterial)
 	require.NoError(t, err)
 	require.Equal(t, LambdaC, len(corrections))
 	require.False(t, bob.Chi.IsZero(), "bob chi should be initialized")
 	require.Equal(t, Xi, len(bob.Gamma))
 
-	alice, err := freshAliceForSession(testSID, m, corrections)
+	alice, err := freshAliceForSession(testSID, m, corrections, oteProof)
 	require.NoError(t, err)
 	require.Equal(t, Xi, len(alice.Alpha0))
 }

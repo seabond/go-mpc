@@ -2,6 +2,7 @@ package dkls23
 
 import (
 	"crypto/rand"
+	"strings"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -38,20 +39,20 @@ func TestOTEPadsDifferAcrossSessionsEvenWhereBetaAgrees(t *testing.T) {
 	// exactly the case the attack exploited, just made total instead of partial.
 	beta := mustBeta(t)
 
-	corrA, err := OTExtReceiverCorrections(sidA, m.BobSeeds0, m.BobSeeds1, beta)
+	corrA, corrAProof, err := OTExtReceiverCorrections(sidA, m.BobSeeds0, m.BobSeeds1, beta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	corrB, err := OTExtReceiverCorrections(sidB, m.BobSeeds0, m.BobSeeds1, beta)
+	corrB, corrBProof, err := OTExtReceiverCorrections(sidB, m.BobSeeds0, m.BobSeeds1, beta)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	a0A, a1A, err := OTExtSenderExpand(sidA, m.AliceSeeds, m.Sigma, corrA)
+	a0A, a1A, err := OTExtSenderExpand(sidA, m.AliceSeeds, m.Sigma, corrA, corrAProof)
 	if err != nil {
 		t.Fatal(err)
 	}
-	a0B, a1B, err := OTExtSenderExpand(sidB, m.AliceSeeds, m.Sigma, corrB)
+	a0B, a1B, err := OTExtSenderExpand(sidB, m.AliceSeeds, m.Sigma, corrB, corrBProof)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,11 +98,11 @@ func TestOTECorrectnessHoldsWithSessionBinding(t *testing.T) {
 	const sid = "session-C:vole:2->1"
 	beta := mustBeta(t)
 
-	corr, err := OTExtReceiverCorrections(sid, bob0, bob1, beta)
+	corr, corrProof, err := OTExtReceiverCorrections(sid, bob0, bob1, beta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	alpha0, alpha1, err := OTExtSenderExpand(sid, aliceSeeds, sigma, corr)
+	alpha0, alpha1, err := OTExtSenderExpand(sid, aliceSeeds, sigma, corr, corrProof)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,39 +127,67 @@ func TestOTECorrectnessHoldsWithSessionBinding(t *testing.T) {
 // Both sides of a directed pair must derive the SAME session id, or the
 // correlation does not cancel and no signature is produced. A mismatch must fail
 // loudly here rather than as an unexplained signing error in production.
-func TestMismatchedSessionIDBreaksTheCorrelation(t *testing.T) {
+//
+// It now fails EARLIER than it used to. The consistency challenge is derived
+// from the sid, so a sender working under a different one computes different
+// challenge coefficients and the proof does not verify — the mismatch is caught
+// before a single pad is derived, rather than surviving as a correlation that
+// silently fails to cancel. That is strictly the better failure, and this test
+// asserts the new one.
+func TestMismatchedSessionIDIsRefusedOutright(t *testing.T) {
 	t.Parallel()
 
 	bob0, bob1, aliceSeeds, sigma := buildBaseOTPair(t)
 	beta := mustBeta(t)
 
-	corr, err := OTExtReceiverCorrections("session-D:vole:2->1", bob0, bob1, beta)
+	corr, corrProof, err := OTExtReceiverCorrections("session-D:vole:2->1", bob0, bob1, beta)
 	if err != nil {
 		t.Fatal(err)
 	}
 	// Alice uses a DIFFERENT sid — the shape a wiring bug would take.
-	alpha0, alpha1, err := OTExtSenderExpand("session-E:vole:2->1", aliceSeeds, sigma, corr)
+	_, _, err = OTExtSenderExpand("session-E:vole:2->1", aliceSeeds, sigma, corr, corrProof)
+	if err == nil {
+		t.Fatal("a sender under a different session id accepted the corrections")
+	}
+	if !strings.Contains(err.Error(), "consistency check failed") {
+		t.Fatalf("mismatched sid was refused for the wrong reason: %v", err)
+	}
+}
+
+// The correlation itself is still checked, under a MATCHING sid, so the property
+// the old test covered is not lost: matching ids must actually cancel.
+func TestMatchingSessionIDsProduceACancellingCorrelation(t *testing.T) {
+	t.Parallel()
+
+	bob0, bob1, aliceSeeds, sigma := buildBaseOTPair(t)
+	beta := mustBeta(t)
+
+	const sid = "session-D:vole:2->1"
+	corr, corrProof, err := OTExtReceiverCorrections(sid, bob0, bob1, beta)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gamma, err := OTExtReceiverExpand("session-D:vole:2->1", bob0, beta, corr)
+	alpha0, alpha1, err := OTExtSenderExpand(sid, aliceSeeds, sigma, corr, corrProof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gamma, err := OTExtReceiverExpand(sid, bob0, beta, corr)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	matches := 0
+	agree := 0
 	for j := range gamma {
 		want := alpha0[j]
 		if beta[j] {
 			want = alpha1[j]
 		}
 		if gamma[j][0] == want[0] {
-			matches++
+			agree++
 		}
 	}
-	if matches != 0 {
-		t.Fatalf("mismatched session ids still produced %d agreeing OTE outputs; "+
-			"the binding is not actually load-bearing", matches)
+	if agree != Xi {
+		t.Fatalf("matching session ids agreed on only %d of %d OTE outputs", agree, Xi)
 	}
 }
 

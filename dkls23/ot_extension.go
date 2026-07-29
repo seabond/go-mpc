@@ -130,20 +130,29 @@ func oteExpandHash(sid string, choice bool, j, i int, seed []byte) [32]byte {
 //
 // Returns corrections[k] = U_k which are sent to Alice.
 // This corresponds to the receiver's first message in IKNP OT extension (paper §4 / FEOTE).
-func OTExtReceiverCorrections(sid string, bobSeeds0, bobSeeds1 [][]byte, beta [Xi]bool) (corrections [][Xi / 8]byte, err error) {
+// It also returns the consistency proof that ONE beta went into every row.
+// Without it the corrections are unverifiable and a malicious receiver reads a
+// bit of the sender's long-term choice vector per session; see ote_consistency.go.
+func OTExtReceiverCorrections(sid string, bobSeeds0, bobSeeds1 [][]byte, beta [Xi]bool) (corrections [][Xi / 8]byte, proof oteConsistencyProof, err error) {
 	if len(bobSeeds0) != LambdaC || len(bobSeeds1) != LambdaC {
-		return nil, errors.New("dkls23 OTExtReceiverCorrections: bobSeeds must have LambdaC entries")
+		return nil, oteConsistencyProof{}, errors.New("dkls23 OTExtReceiverCorrections: bobSeeds must have LambdaC entries")
 	}
 	betaVec := boolsToBitVec(beta)
 	corrections = make([][Xi / 8]byte, LambdaC)
+	T := make([][Xi / 8]byte, LambdaC)
 	for k := 0; k < LambdaC; k++ {
 		T_k := prg(sid, bobSeeds0[k])
 		prg1_k := prg(sid, bobSeeds1[k])
 		// U_k = T_k XOR PRG(K^1_k) XOR beta
 		U_k := xorBitVec(xorBitVec(T_k, prg1_k), betaVec)
 		corrections[k] = U_k
+		T[k] = T_k
 	}
-	return
+	proof, err = oteProve(sid, T, beta, corrections)
+	if err != nil {
+		return nil, oteConsistencyProof{}, err
+	}
+	return corrections, proof, nil
 }
 
 // OTExtSenderExpand expands Alice's OTE seeds into Zq-element output pairs.
@@ -154,7 +163,13 @@ func OTExtReceiverCorrections(sid string, bobSeeds0, bobSeeds1 [][]byte, beta [X
 // The output alpha0[j][i] and alpha1[j][i] are the two OT messages for OT index j,
 // element index i. They are computed by hashing the columns of Q.
 // This is the sender's expansion step in IKNP OT extension.
-func OTExtSenderExpand(sid string, aliceSeeds [][]byte, sigma []bool, corrections [][Xi / 8]byte) (alpha0, alpha1 [][Ell + Rho][32]byte, err error) {
+// It REFUSES corrections that fail the consistency proof. That check is not
+// optional hardening: IKNP on its own is secure only against a receiver who
+// follows the protocol, and a receiver who does not reads one bit of sigma per
+// session off whether his own downstream check passes. sigma is long-lived, the
+// bits accumulate, and the sender cannot attribute any of it. See
+// ote_consistency.go.
+func OTExtSenderExpand(sid string, aliceSeeds [][]byte, sigma []bool, corrections [][Xi / 8]byte, proof oteConsistencyProof) (alpha0, alpha1 [][Ell + Rho][32]byte, err error) {
 	if len(aliceSeeds) != LambdaC || len(sigma) != LambdaC || len(corrections) != LambdaC {
 		return nil, nil, errors.New("dkls23 OTExtSenderExpand: length mismatch")
 	}
@@ -174,6 +189,13 @@ func OTExtSenderExpand(sid string, aliceSeeds [][]byte, sigma []bool, correction
 		if sigma[k] {
 			Q[k] = xorBitVec(Q[k], corrections[k])
 		}
+	}
+
+	// Verified against the Q she just built, and BEFORE a single pad is derived
+	// from it: a check that ran after the expansion would be a check on values the
+	// caller already holds.
+	if err := oteVerify(sid, Q, sigma, corrections, proof); err != nil {
+		return nil, nil, err
 	}
 
 	// sigma_vec ∈ {0,1}^LambdaC as LambdaC/8 bytes (for column XOR)

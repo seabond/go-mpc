@@ -125,30 +125,30 @@ func sampleBeta() (beta [Xi]bool, err error) {
 // Passing sid is not bookkeeping: without it the OT extension expands a fixed
 // base-OT seed to a fixed pad, and a fresh beta only re-selects among those
 // fixed pads. See prg in ot_extension.go for what that costs.
-func freshBobForSession(sid string, m *BaseOTMaterial) (*VOLEBobState, [][Xi / 8]byte, error) {
+func freshBobForSession(sid string, m *BaseOTMaterial) (*VOLEBobState, [][Xi / 8]byte, oteConsistencyProof, error) {
 	beta, err := sampleBeta()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, oteConsistencyProof{}, err
 	}
-	corrections, err := OTExtReceiverCorrections(sid, m.BobSeeds0, m.BobSeeds1, beta)
+	corrections, proof, err := OTExtReceiverCorrections(sid, m.BobSeeds0, m.BobSeeds1, beta)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 freshBobForSession: corrections: %w", err)
+		return nil, nil, oteConsistencyProof{}, fmt.Errorf("dkls23 freshBobForSession: corrections: %w", err)
 	}
 	gamma, err := OTExtReceiverExpand(sid, m.BobSeeds0, beta, corrections)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 freshBobForSession: expand: %w", err)
+		return nil, nil, oteConsistencyProof{}, fmt.Errorf("dkls23 freshBobForSession: expand: %w", err)
 	}
 	bob, err := VOLEBobSample(gamma, beta)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 freshBobForSession: sample: %w", err)
+		return nil, nil, oteConsistencyProof{}, fmt.Errorf("dkls23 freshBobForSession: sample: %w", err)
 	}
-	return bob, corrections, nil
+	return bob, corrections, proof, nil
 }
 
 // freshAliceForSession derives a single-use VOLE Alice state from the corrections the
 // counterparty produced as Bob for this session.
-func freshAliceForSession(sid string, m *BaseOTMaterial, theirCorrections [][Xi / 8]byte) (*VOLEAliceState, error) {
-	alpha0, alpha1, err := OTExtSenderExpand(sid, m.AliceSeeds, m.Sigma, theirCorrections)
+func freshAliceForSession(sid string, m *BaseOTMaterial, theirCorrections [][Xi / 8]byte, proof oteConsistencyProof) (*VOLEAliceState, error) {
+	alpha0, alpha1, err := OTExtSenderExpand(sid, m.AliceSeeds, m.Sigma, theirCorrections, proof)
 	if err != nil {
 		return nil, fmt.Errorf("dkls23 freshAliceForSession: expand: %w", err)
 	}
@@ -243,6 +243,13 @@ type Round1Msg struct {
 	// These are per-recipient, not broadcast: each counterparty gets corrections
 	// derived from an independently sampled beta.
 	OTECorrections [][Xi / 8]byte
+	// OTECheckT and OTECheckX are the OT-extension consistency proof for the
+	// corrections above: sum_j chi_j*t^j and sum_j chi_j*beta_j over GF(2^128).
+	// They travel with the corrections because they are what makes them usable —
+	// the recipient refuses corrections it cannot check, so this is not an
+	// optional annex to the message.
+	OTECheckT [16]byte
+	OTECheckX [16]byte
 }
 
 // checkBlacklist returns a BlacklistedPartyError if any of the given party IDs
@@ -359,7 +366,7 @@ func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 				Detail: fmt.Sprintf("missing base OT material for party %d", j),
 			}
 		}
-		bob, corrections, err := freshBobForSession(voleSIDForPair(sigID, j, setup.MyID), material)
+		bob, corrections, oteProof, err := freshBobForSession(voleSIDForPair(sigID, j, setup.MyID), material)
 		if err != nil {
 			return nil, nil, fmt.Errorf("dkls23 SignRound1: fresh VOLE Bob for %d: %w", j, err)
 		}
@@ -384,7 +391,12 @@ func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 
 		com := commitWithSalt(commitMsgForPeer(R_iPoint, psiArr[:]), salt)
 		coms[j] = com
-		outMsgs[j] = &Round1Msg{Commitment: com, OTECorrections: corrections}
+		outMsgs[j] = &Round1Msg{
+			Commitment:     com,
+			OTECorrections: corrections,
+			OTECheckT:      oteProof.TTilde,
+			OTECheckX:      oteProof.XTilde,
+		}
 	}
 
 	state := &Round1State{
@@ -548,7 +560,8 @@ func signRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 				Detail: fmt.Sprintf("party %d sent %d OTE correction vectors, want %d", j, len(msg1.OTECorrections), LambdaC),
 			}
 		}
-		aliceState, err := freshAliceForSession(voleSIDForPair(state.SigID, setup.MyID, j), material, msg1.OTECorrections)
+		aliceState, err := freshAliceForSession(voleSIDForPair(state.SigID, setup.MyID, j), material,
+			msg1.OTECorrections, oteConsistencyProof{TTilde: msg1.OTECheckT, XTilde: msg1.OTECheckX})
 		if err != nil {
 			return nil, nil, fmt.Errorf("dkls23 SignRound2: fresh VOLE Alice for %d: %w", j, err)
 		}
