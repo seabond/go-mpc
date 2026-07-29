@@ -35,19 +35,6 @@ func randomBools(t *testing.T, n int) []bool {
 	return out
 }
 
-// randomBetaXi returns a random [Xi]bool.
-func randomBetaXi(t *testing.T) [Xi]bool {
-	t.Helper()
-	buf := make([]byte, (Xi+7)/8)
-	_, err := rand.Read(buf)
-	require.NoError(t, err)
-	var beta [Xi]bool
-	for j := 0; j < Xi; j++ {
-		beta[j] = (buf[j/8]>>(uint(j)%8))&1 == 1
-	}
-	return beta
-}
-
 // computeRx reconstructs R = sum(R_j) from round2 states and returns the x-coordinate mod q.
 func computeRx(t *testing.T, signers []int, round2States map[int]*Round2State) btcec.ModNScalar {
 	t.Helper()
