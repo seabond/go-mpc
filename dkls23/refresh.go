@@ -261,6 +261,22 @@ func refreshFinalize(
 			continue
 		}
 
+		// The DEGREE is checked before the commitments are used, because
+		// refreshFeldmanVerify derives it from the vector it is handed and would
+		// happily verify a higher-degree polynomial against itself.
+		//
+		// A zero-constant polynomial of degree t still has f(0) = 0, so the group
+		// key is preserved and every FCom, Feldman and seed check passes — while the
+		// refreshed shares land on a polynomial t parties cannot interpolate. Refresh
+		// OVERWRITES setup.Share in place, so by the time the next signature fails
+		// the shares that did reconstruct are gone from every node. That makes this
+		// worse than the same hole in DKG, where the damage is confined to a wallet
+		// nobody has funded yet.
+		if got, want := len(r1j.FeldmanCommitments), setup.Threshold-1; got != want {
+			badSenders = append(badSenders, j)
+			continue
+		}
+
 		// Step 2: Feldman verification: f_j(myID)·G = Σ_{k=1}^{t-1} C_{j,k}·myID^k.
 		var shareVal btcec.ModNScalar
 		shareVal.SetByteSlice(shareBytes)
