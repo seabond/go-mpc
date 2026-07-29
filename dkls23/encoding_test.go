@@ -216,8 +216,15 @@ func TestEncodingSignerSetup(t *testing.T) {
 		require.Equal(t, s.PubKey, got.PubKey, "party %d PubKey", id)
 		require.Equal(t, s.Threshold, got.Threshold, "party %d Threshold", id)
 		require.Equal(t, s.Epoch, got.Epoch, "party %d Epoch", id)
-		require.Equal(t, len(s.VoleAlice), len(got.VoleAlice), "party %d VoleAlice", id)
-		require.Equal(t, len(s.VoleBob), len(got.VoleBob), "party %d VoleBob", id)
+		require.Equal(t, len(s.BaseOT), len(got.BaseOT), "party %d BaseOT", id)
+		for peer, want := range s.BaseOT {
+			gotMat := got.BaseOT[peer]
+			require.NotNil(t, gotMat, "party %d BaseOT[%d]", id, peer)
+			require.Equal(t, want.BobSeeds0, gotMat.BobSeeds0, "party %d BaseOT[%d].BobSeeds0", id, peer)
+			require.Equal(t, want.BobSeeds1, gotMat.BobSeeds1, "party %d BaseOT[%d].BobSeeds1", id, peer)
+			require.Equal(t, want.AliceSeeds, gotMat.AliceSeeds, "party %d BaseOT[%d].AliceSeeds", id, peer)
+			require.Equal(t, want.Sigma, gotMat.Sigma, "party %d BaseOT[%d].Sigma", id, peer)
+		}
 		require.Equal(t, len(s.FZeroSeeds), len(got.FZeroSeeds), "party %d FZeroSeeds", id)
 	}
 }
@@ -506,4 +513,45 @@ func TestDecodeBoolArrayBadBase64(t *testing.T) {
 func TestDecodeBoolArrayBadSize(t *testing.T) {
 	_, err := decodeBoolArray("AA==")
 	require.Error(t, err)
+}
+
+// A setup written before per-session VOLE stored a long-lived correlation and never
+// retained the base OT it came from, so it cannot be upgraded in place. Decoding one
+// must say that plainly rather than yielding a setup with no base OT that fails at
+// first signature.
+func TestSignerSetupRejectsLegacyVOLEFormat(t *testing.T) {
+	t.Parallel()
+	legacy := []byte(`{
+		"my_id": 1,
+		"all_ids": [1,2,3],
+		"share": "0000000000000000000000000000000000000000000000000000000000000001",
+		"pub_key": "",
+		"threshold": 2,
+		"vole_alice": {"2": {}},
+		"vole_bob": {"2": {}},
+		"fzero_seeds": {},
+		"blacklist": {},
+		"epoch": 0,
+		"sign_counter": 0
+	}`)
+	var s SignerSetup
+	err := json.Unmarshal(legacy, &s)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "base OT")
+}
+
+// Base OT material of the wrong shape must be rejected at decode time, not at first
+// use: a setup that loads but cannot sign is a far worse failure than one that
+// refuses to load.
+func TestBaseOTMaterialRejectsWrongLengthsOnDecode(t *testing.T) {
+	t.Parallel()
+	var m BaseOTMaterial
+	err := json.Unmarshal([]byte(`{
+		"bob_seeds0": ["00"],
+		"bob_seeds1": ["00"],
+		"alice_seeds": ["00"],
+		"sigma": [false]
+	}`), &m)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "base OT material")
 }

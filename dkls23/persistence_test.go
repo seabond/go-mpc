@@ -71,8 +71,14 @@ func TestMarshalUnmarshalSetup(t *testing.T) {
 		require.Equal(t, s.PubKey, got.PubKey)
 		require.Equal(t, s.Threshold, got.Threshold)
 		require.Equal(t, s.Epoch, got.Epoch)
-		require.Equal(t, len(s.VoleAlice), len(got.VoleAlice))
-		require.Equal(t, len(s.VoleBob), len(got.VoleBob))
+		require.Equal(t, len(s.BaseOT), len(got.BaseOT))
+		for peer, want := range s.BaseOT {
+			gotMat := got.BaseOT[peer]
+			require.NotNil(t, gotMat, "party %d BaseOT[%d]", id, peer)
+			require.Equal(t, want.BobSeeds0, gotMat.BobSeeds0)
+			require.Equal(t, want.AliceSeeds, gotMat.AliceSeeds)
+			require.Equal(t, want.Sigma, gotMat.Sigma)
+		}
 		require.Equal(t, len(s.FZeroSeeds), len(got.FZeroSeeds))
 	}
 }

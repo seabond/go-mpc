@@ -21,10 +21,12 @@ package dkls23
 //
 // Secret preserved: Lagrange(share', 0) = Lagrange(share, 0) since Σ_i f_i(0) = 0.
 //
-// VOLE re-randomization (KMOS21 §4 – Beaver OT re-randomization):
+// Base OT re-randomization (KMOS21 §4 – Beaver OT re-randomization):
 // A public SHAKE-256 stream seeded from a collectively committed combined seed
 // drives per-instance bit flips and mask XORs that maintain the OT correlation
-// invariant: gamma[k] = alpha_{beta[k]}[k].
+// invariant, now one level down: the receiver's seed stays the sender's seed for
+// its choice bit, a_k' = s'_{sigma_k',k}. Signing derives its VOLE fresh from this
+// base OT every session, so there is no long-lived correlation left to refresh.
 //
 // FZero seed refresh: per-pair seeds re-derived from the combined seed so that
 // zero-sharing remains unbiased in future signing sessions.
@@ -190,7 +192,7 @@ func refreshRound2(setup *SignerSetup, coeffs []btcec.ModNScalar, mySeed [16]byt
 //  3. Verifies seed FCom decommitment.
 //  4. Derives combinedSeed = XOR of all n party seeds.
 //  5. Updates the Shamir share: share += Σ_j f_j(myID) mod q.
-//  6. Re-randomizes all VOLE states via Beaver OT refresh (KMOS21 §4).
+//  6. Re-randomizes the pairwise base OT via Beaver OT refresh (KMOS21 §4).
 //  7. Derives new per-pair FZero seeds from combinedSeed.
 //  8. Increments setup.Epoch.
 //
@@ -307,24 +309,22 @@ func refreshFinalize(
 	var newShare btcec.ModNScalar
 	newShare.Add2(&setup.Share, &shareAdd)
 
-	// Step 6: Re-randomize VOLE states into temporary maps.
+	// Step 6: Re-randomize the base OT into a temporary map.
 	// Built separately so setup is untouched if any step fails.
-	newVoleAlice := make(map[int]*VOLEAliceState, len(setup.AllIDs)-1)
-	newVoleBob := make(map[int]*VOLEBobState, len(setup.AllIDs)-1)
+	//
+	// This used to re-randomize stored VOLE correlations. There are none any more —
+	// each signing session derives its own from this base OT — so refresh operates one
+	// level down, on the base OT itself.
+	newBaseOT := make(map[int]*BaseOTMaterial, len(setup.AllIDs)-1)
 	for _, j := range setup.AllIDs {
 		if j == setup.MyID {
 			continue
 		}
-		a, err := refreshVOLEAlice(setup.VoleAlice[j], setup.MyID, j, combinedSeed)
+		m, err := refreshBaseOT(setup.BaseOT[j], setup.MyID, j, combinedSeed)
 		if err != nil {
-			return fmt.Errorf("dkls23 RefreshFinalize: refreshVOLEAlice(%d→%d): %w", setup.MyID, j, err)
+			return fmt.Errorf("dkls23 RefreshFinalize: refreshBaseOT(%d↔%d): %w", setup.MyID, j, err)
 		}
-		b, err := refreshVOLEBob(setup.VoleBob[j], j, setup.MyID, combinedSeed)
-		if err != nil {
-			return fmt.Errorf("dkls23 RefreshFinalize: refreshVOLEBob(%d→%d): %w", j, setup.MyID, err)
-		}
-		newVoleAlice[j] = a
-		newVoleBob[j] = b
+		newBaseOT[j] = m
 	}
 
 	// Step 7: Derive new FZero seeds from combinedSeed.
@@ -341,8 +341,7 @@ func refreshFinalize(
 
 	// All mutations succeed atomically from this point.
 	setup.Share = newShare
-	setup.VoleAlice = newVoleAlice
-	setup.VoleBob = newVoleBob
+	setup.BaseOT = newBaseOT
 	setup.FZeroSeeds = newFZeroSeeds
 	setup.Epoch++
 	return nil
@@ -420,90 +419,110 @@ func refreshFeldmanVerify(share *btcec.ModNScalar, x int, nonConstFeldman [][]by
 	return nil
 }
 
-// refreshVOLEAlice applies Beaver OT re-randomization to Alice's VOLE state
-// for the directed pair (aliceID → bobID). Returns a new state; the original
-// is not modified.
-func refreshVOLEAlice(state *VOLEAliceState, aliceID, bobID int, combinedSeed [16]byte) (*VOLEAliceState, error) {
-	xof := newVOLERefreshStream(combinedSeed, aliceID, bobID)
-
-	newAlpha0 := make([][Ell + Rho][32]byte, Xi)
-	newAlpha1 := make([][Ell + Rho][32]byte, Xi)
-
-	var bPrimeBuf [1]byte
-	for k := 0; k < Xi; k++ {
-		xof.Read(bPrimeBuf[:])
-		bPrime := (bPrimeBuf[0] & 1) == 1
-
-		var r0, r1 [Ell + Rho][32]byte
-		for i := 0; i < Ell+Rho; i++ {
-			xof.Read(r0[i][:])
-			xof.Read(r1[i][:])
+// refreshBaseOT re-randomizes one party's base-OT material toward a single
+// counterparty, in both directions. It returns a new value; the original is not
+// modified.
+//
+// Both parties derive the same per-direction stream from combinedSeed and apply
+// MATCHED transforms, so the base OT stays consistent across the pair without any
+// extra messages:
+//
+//	shared per index k:  a bit c_k, and two 32-byte masks m0_k, m1_k
+//	sender (VOLE Bob) side, holding (s0_k, s1_k):
+//	    s0_k' = (c_k ? s1_k : s0_k) XOR m0_k
+//	    s1_k' = (c_k ? s0_k : s1_k) XOR m1_k
+//	receiver (VOLE Alice) side, holding sigma_k and a_k = s_{sigma_k,k}:
+//	    sigma_k' = sigma_k XOR c_k
+//	    a_k'     = a_k XOR m_{sigma_k',k}
+//
+// The receiver's invariant a_k' = s'_{sigma_k',k} holds in all four (c_k, sigma_k)
+// cases, which is what makes the pair still able to run OT extension afterwards.
+//
+// HONEST LIMITATION, unchanged from the VOLE re-randomization this replaces:
+// combinedSeed is derived from every party's contributed seed, so a party that
+// PARTICIPATED in the refresh can recompute the transform and track the material
+// across epochs. Refresh therefore protects against an attacker who held material
+// from an earlier epoch and was absent from the refresh — not against a resident one.
+// Evicting a resident attacker requires a fresh base OT, i.e. re-pairing.
+func refreshBaseOT(m *BaseOTMaterial, myID, peerID int, combinedSeed [16]byte) (*BaseOTMaterial, error) {
+	if m == nil {
+		return nil, &CorruptStateError{
+			Phase:  "RefreshFinalize",
+			Detail: fmt.Sprintf("missing base OT material for party %d", peerID),
 		}
-
-		var src0, src1 [Ell + Rho][32]byte
-		if bPrime {
-			src0 = state.Alpha1[k]
-			src1 = state.Alpha0[k]
-		} else {
-			src0 = state.Alpha0[k]
-			src1 = state.Alpha1[k]
-		}
-
-		for i := 0; i < Ell+Rho; i++ {
-			for b := 0; b < 32; b++ {
-				newAlpha0[k][i][b] = src0[i][b] ^ r0[i][b]
-				newAlpha1[k][i][b] = src1[i][b] ^ r1[i][b]
-			}
+	}
+	if len(m.BobSeeds0) != LambdaC || len(m.BobSeeds1) != LambdaC ||
+		len(m.AliceSeeds) != LambdaC || len(m.Sigma) != LambdaC {
+		return nil, &CorruptStateError{
+			Phase: "RefreshFinalize",
+			Detail: fmt.Sprintf("base OT material for party %d has lengths %d/%d/%d/%d, want %d each",
+				peerID, len(m.BobSeeds0), len(m.BobSeeds1), len(m.AliceSeeds), len(m.Sigma), LambdaC),
 		}
 	}
 
-	newState, err := VOLEAliceSetup(newAlpha0, newAlpha1)
-	if err != nil {
-		return nil, fmt.Errorf("dkls23 refreshVOLEAlice: VOLEAliceSetup: %w", err)
+	out := &BaseOTMaterial{
+		BobSeeds0:  make([][]byte, LambdaC),
+		BobSeeds1:  make([][]byte, LambdaC),
+		AliceSeeds: make([][]byte, LambdaC),
+		Sigma:      make([]bool, LambdaC),
 	}
-	return newState, nil
+
+	// I am VOLE Bob in the direction (peer -> me), so my sender seeds are refreshed
+	// under that direction's stream. The swap bit c is derived from combinedSeed and
+	// is therefore known to every party — branching on it leaks nothing, unlike sigma
+	// below.
+	bobXOF := newBaseOTRefreshStream(combinedSeed, peerID, myID)
+	for k := 0; k < LambdaC; k++ {
+		c, mask0, mask1 := readRefreshStep(bobXOF)
+		src0, src1 := m.BobSeeds0[k], m.BobSeeds1[k]
+		if c {
+			src0, src1 = src1, src0
+		}
+		out.BobSeeds0[k] = xorBytes(src0, mask0[:])
+		out.BobSeeds1[k] = xorBytes(src1, mask1[:])
+	}
+
+	// I am VOLE Alice in the direction (me -> peer). sigma is secret, so the mask
+	// choice it drives must be branchless — same treatment the VOLE re-randomization
+	// this replaced gave it.
+	aliceXOF := newBaseOTRefreshStream(combinedSeed, myID, peerID)
+	for k := 0; k < LambdaC; k++ {
+		c, mask0, mask1 := readRefreshStep(aliceXOF)
+		newSigma := m.Sigma[k] != c // XOR
+		mask := mask0
+		subtle.ConstantTimeCopy(int(condUint32(newSigma)), mask[:], mask1[:])
+		out.Sigma[k] = newSigma
+		out.AliceSeeds[k] = xorBytes(m.AliceSeeds[k], mask[:])
+	}
+
+	return out, nil
 }
 
-// refreshVOLEBob applies Beaver OT re-randomization to Bob's VOLE state
-// for the directed pair (aliceID → bobID). Returns a new state; the original
-// is not modified.
-func refreshVOLEBob(state *VOLEBobState, aliceID, bobID int, combinedSeed [16]byte) (*VOLEBobState, error) {
-	xof := newVOLERefreshStream(combinedSeed, aliceID, bobID)
+// readRefreshStep draws one index's worth of shared randomness: the swap bit and the
+// two seed masks. Both sides of a directed pair must consume the stream in exactly
+// this order for the transforms to match.
+func readRefreshStep(xof sha3.ShakeHash) (c bool, mask0, mask1 [baseOTSeedLen]byte) {
+	var bit [1]byte
+	xof.Read(bit[:])
+	c = (bit[0] & 1) == 1
+	xof.Read(mask0[:])
+	xof.Read(mask1[:])
+	return c, mask0, mask1
+}
 
-	var newBeta [Xi]bool
-	newGamma := make([][Ell + Rho][32]byte, Xi)
-
-	var bPrimeBuf [1]byte
-	for k := 0; k < Xi; k++ {
-		xof.Read(bPrimeBuf[:])
-		bPrime := (bPrimeBuf[0] & 1) == 1
-
-		var r0, r1 [Ell + Rho][32]byte
-		for i := 0; i < Ell+Rho; i++ {
-			xof.Read(r0[i][:])
-			xof.Read(r1[i][:])
-		}
-
-		newBeta[k] = state.Beta[k] != bPrime // XOR of booleans
-
-		// Branchless mask selection: start with r0, conditionally overwrite with r1.
-		sel := int(condUint32(newBeta[k]))
-		mask := r0
-		for i := 0; i < Ell+Rho; i++ {
-			subtle.ConstantTimeCopy(sel, mask[i][:], r1[i][:])
-		}
-		for i := 0; i < Ell+Rho; i++ {
-			for b := 0; b < 32; b++ {
-				newGamma[k][i][b] = state.Gamma[k][i][b] ^ mask[i][b]
-			}
-		}
+// xorBytes returns src XOR mask, truncating the mask to len(src).
+func xorBytes(src, mask []byte) []byte {
+	out := make([]byte, len(src))
+	for i := range src {
+		out[i] = src[i] ^ mask[i]
 	}
+	return out
+}
 
-	return &VOLEBobState{
-		Beta:  newBeta,
-		Gamma: newGamma,
-		Chi:   GadgetInnerProduct(newBeta),
-	}, nil
+// newBaseOTRefreshStream returns a SHAKE-256 XOF for re-randomizing the directed
+// base OT (aliceID -> bobID), where aliceID is the OTE sender / VOLE Alice.
+func newBaseOTRefreshStream(combinedSeed [16]byte, aliceID, bobID int) sha3.ShakeHash {
+	return newVOLERefreshStream(combinedSeed, aliceID, bobID)
 }
 
 // newVOLERefreshStream returns a SHAKE-256 XOF for re-randomizing the directed
