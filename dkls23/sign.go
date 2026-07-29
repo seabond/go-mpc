@@ -226,6 +226,10 @@ type Round1State struct {
 	// VoleBobForRound2 holds Pi's VOLE Bob state per counterparty j (Pi is Bob, j is Alice).
 	// Used in round 3 to run VOLEBobReceive against j's VOLE multiply message.
 	VoleBobForRound2 map[int]*VOLEBobState
+	// round2Done marks the state spent, exactly as round3Done does for Round2State.
+	// Unexported so no caller can clear it, and carried through the JSON encoding
+	// so a state that is persisted and restored stays spent.
+	round2Done atomic.Bool
 }
 
 // Round1Msg is Pi's round 1 broadcast/send to each counterparty.
@@ -472,6 +476,27 @@ func SignRound2(setup *SignerSetup, r1state *Round1State, allRound1 map[int]*Rou
 }
 
 func signRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round1Msg) (*Round2State, map[int]*Round2Msg, error) {
+	// A Round1State is single-use, for the same reason a Round2State is, and the
+	// consequence of missing it here is worse.
+	//
+	// Round 2 runs the OTE sender expansion over corrections the COUNTERPARTY
+	// supplies, against this party's long-lived base-OT choice vector sigma. Alice's
+	// pad in column j changes under a flipped correction bit exactly when
+	// sigma[j] = 1, and aTilde carries the difference. Run round 2 twice on one
+	// Round1State — same r_i, same sk_i, same sigma — and comparing the two aTilde
+	// matrices reads sigma off directly: 128 bits from two calls, no error.
+	//
+	// sigma is not session material. It lives in BaseOTMaterial and is reused with
+	// that peer forever, so this is not a leak within one signature but the
+	// permanent loss of the pairwise OT setup. Marked spent on ENTRY, before any
+	// check that could fail, so a rejected attempt buys no retry.
+	if !state.round2Done.CompareAndSwap(false, true) {
+		return nil, nil, &InvalidInputError{
+			Phase:  "SignRound2",
+			Detail: fmt.Sprintf("round 2 already ran for session %q: a Round1State is single-use", state.SigID),
+		}
+	}
+
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
 	if err := checkBlacklist(setup, state.Signers, "SignRound2"); err != nil {

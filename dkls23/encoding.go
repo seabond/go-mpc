@@ -562,6 +562,10 @@ type round1StateJSON struct {
 	Psi              map[string]string        `json:"psi"`
 	ZetaI            string                   `json:"zeta_i"`
 	VoleBobForRound2 map[string]*VOLEBobState `json:"vole_bob_for_round2"`
+	// Round2Done carries the single-use marker across serialization, exactly as
+	// Round3Done does for Round2State. Dropping it would let a state that is
+	// persisted and restored run round 2 a second time, which is the whole attack.
+	Round2Done bool `json:"round2_done"`
 }
 
 func (s *Round1State) MarshalJSON() ([]byte, error) {
@@ -571,6 +575,7 @@ func (s *Round1State) MarshalJSON() ([]byte, error) {
 		RI:               scalarToHex(&s.R_i),
 		PhiI:             scalarToHex(&s.Phi_i),
 		RIPoint:          hex.EncodeToString(s.R_iPoint),
+		Round2Done:       s.round2Done.Load(),
 		Com:              intMap32ToJSON(s.Com),
 		Salt:             hex.EncodeToString(s.Salt[:]),
 		Psi:              intMap32ToJSON(s.Psi),
@@ -616,6 +621,7 @@ func (s *Round1State) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	s.VoleBobForRound2, err = stringMapKeys(j.VoleBobForRound2)
+	s.round2Done.Store(j.Round2Done)
 	return err
 }
 
