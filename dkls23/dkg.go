@@ -308,6 +308,19 @@ func dkgFinalize(
 			continue
 		}
 
+		// The commitment vector fixes the DEGREE of j's polynomial, and
+		// feldmanVerify reads that degree off the vector itself rather than off the
+		// threshold. Unchecked, j picks its own degree: with t+1 commitments every
+		// pairwise and Feldman check below still passes, and pk = sum_j C_{j,0} is
+		// still the honest constant term, so the DKG succeeds for everyone. But the
+		// shares then lie on a degree-t polynomial while only t parties hold points
+		// on it, so Lagrange over the signers does not return the secret behind that
+		// public key. The wallet is created and can never sign.
+		if len(r1j.FeldmanCommitments) != config.Threshold {
+			badSenders = append(badSenders, j)
+			continue
+		}
+
 		// Get the share pj(myID) sent by party j.
 		shareBytes := r2j.SecretShares[config.MyID]
 		if len(shareBytes) != 32 {
@@ -343,9 +356,19 @@ func dkgFinalize(
 	}
 
 	// Compute master public key: pk = sum_j C_{j,0} (EC point addition).
+	//
+	// Own entry included, and it is the one the loop above never checked: the
+	// per-sender validation skips j == MyID. A caller that passes only its peers'
+	// round 1 outputs would otherwise index into a nil message here.
 	var pk btcec.JacobianPoint
 	for _, j := range config.AllIDs {
 		r1j := allRound1[j]
+		if r1j == nil || len(r1j.FeldmanCommitments) != config.Threshold {
+			return btcec.ModNScalar{}, nil, &InvalidInputError{
+				Phase:  "DKGFinalize",
+				Detail: fmt.Sprintf("party %d: expected %d Feldman commitments", j, config.Threshold),
+			}
+		}
 		C_j0, err2 := compressedToPoint(r1j.FeldmanCommitments[0])
 		if err2 != nil {
 			return btcec.ModNScalar{}, nil, fmt.Errorf("dkls23: parse C_{%d,0}: %w", j, err2)

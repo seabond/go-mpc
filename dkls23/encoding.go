@@ -505,13 +505,30 @@ func (m *VOLEMultiplyMsg) UnmarshalJSON(data []byte) error {
 // Round1Msg
 // =====================================================================
 
+// Round1Msg needs custom encoding for the same reason OTExtCorrectionsMsg does:
+// [][Xi/8]byte is a slice of fixed-size arrays and does not serialize usefully by
+// default.
 type round1MsgJSON struct {
-	Commitment string `json:"commitment"`
+	Commitment     string   `json:"commitment"`
+	OTECorrections []string `json:"ote_corrections"`
+	// The OT-extension consistency proof travels WITH the corrections it
+	// authorizes. Omitting it here decoded to a zero proof, which fails
+	// verification — so a message that survived this encoding was a message the
+	// recipient then refused, and the corrections it carried were unusable.
+	OTECheckT string `json:"ote_check_t"`
+	OTECheckX string `json:"ote_check_x"`
 }
 
 func (m *Round1Msg) MarshalJSON() ([]byte, error) {
+	corrs := make([]string, len(m.OTECorrections))
+	for i, c := range m.OTECorrections {
+		corrs[i] = hex.EncodeToString(c[:])
+	}
 	return json.Marshal(round1MsgJSON{
-		Commitment: hex.EncodeToString(m.Commitment[:]),
+		Commitment:     hex.EncodeToString(m.Commitment[:]),
+		OTECorrections: corrs,
+		OTECheckT:      hex.EncodeToString(m.OTECheckT[:]),
+		OTECheckX:      hex.EncodeToString(m.OTECheckX[:]),
 	})
 }
 
@@ -521,8 +538,31 @@ func (m *Round1Msg) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	var err error
-	m.Commitment, err = hexToFixed32(j.Commitment)
-	return err
+	if m.Commitment, err = hexToFixed32(j.Commitment); err != nil {
+		return err
+	}
+	m.OTECorrections = make([][Xi / 8]byte, len(j.OTECorrections))
+	for i, s := range j.OTECorrections {
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			return fmt.Errorf("Round1Msg.OTECorrections[%d]: %w", i, err)
+		}
+		if len(b) != Xi/8 {
+			return fmt.Errorf("Round1Msg.OTECorrections[%d]: got %d bytes, want %d", i, len(b), Xi/8)
+		}
+		copy(m.OTECorrections[i][:], b)
+	}
+	// Refused rather than defaulted. A zero proof is not a missing field, it is a
+	// proof that will fail verification, and decoding to one turns "this message
+	// predates the consistency check" into "this peer sent corrections it cannot
+	// justify" — which is the correct conclusion, but reached far too late.
+	if m.OTECheckT, err = hexToFixed16(j.OTECheckT); err != nil {
+		return fmt.Errorf("Round1Msg.OTECheckT: %w", err)
+	}
+	if m.OTECheckX, err = hexToFixed16(j.OTECheckX); err != nil {
+		return fmt.Errorf("Round1Msg.OTECheckX: %w", err)
+	}
+	return nil
 }
 
 // =====================================================================
@@ -535,10 +575,15 @@ type round1StateJSON struct {
 	RI               string                   `json:"r_i"`
 	PhiI             string                   `json:"phi_i"`
 	RIPoint          string                   `json:"r_i_point"`
-	Com              string                   `json:"com"`
+	Com              map[string]string        `json:"com"`
 	Salt             string                   `json:"salt"`
+	Psi              map[string]string        `json:"psi"`
 	ZetaI            string                   `json:"zeta_i"`
 	VoleBobForRound2 map[string]*VOLEBobState `json:"vole_bob_for_round2"`
+	// Round2Done carries the single-use marker across serialization, exactly as
+	// Round3Done does for Round2State. Dropping it would let a state that is
+	// persisted and restored run round 2 a second time, which is the whole attack.
+	Round2Done bool `json:"round2_done"`
 }
 
 func (s *Round1State) MarshalJSON() ([]byte, error) {
@@ -548,8 +593,10 @@ func (s *Round1State) MarshalJSON() ([]byte, error) {
 		RI:               scalarToHex(&s.R_i),
 		PhiI:             scalarToHex(&s.Phi_i),
 		RIPoint:          hex.EncodeToString(s.R_iPoint),
-		Com:              hex.EncodeToString(s.Com[:]),
+		Round2Done:       s.round2Done.Load(),
+		Com:              intMap32ToJSON(s.Com),
 		Salt:             hex.EncodeToString(s.Salt[:]),
+		Psi:              intMap32ToJSON(s.Psi),
 		ZetaI:            scalarToHex(&s.ZetaI),
 		VoleBobForRound2: intMapKeys(s.VoleBobForRound2),
 	})
@@ -575,11 +622,15 @@ func (s *Round1State) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	s.Com, err = hexToFixed32(j.Com)
+	s.Com, err = jsonToIntMap32(j.Com)
 	if err != nil {
 		return err
 	}
 	s.Salt, err = hexToFixed32(j.Salt)
+	if err != nil {
+		return err
+	}
+	s.Psi, err = jsonToIntMap32(j.Psi)
 	if err != nil {
 		return err
 	}
@@ -588,6 +639,7 @@ func (s *Round1State) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	s.VoleBobForRound2, err = stringMapKeys(j.VoleBobForRound2)
+	s.round2Done.Store(j.Round2Done)
 	return err
 }
 
@@ -601,6 +653,10 @@ type round2StateJSON struct {
 	CU            map[string]string `json:"c_u"`
 	CV            map[string]string `json:"c_v"`
 	Round1Commits map[string]string `json:"round1_commits"`
+	// Round3Done carries the single-use marker across serialization. Dropping it
+	// would let a snapshot-and-restore replay round 3 against a spent state, which
+	// is the key-recovery break signRound3 refuses.
+	Round3Done bool `json:"round3_done"`
 }
 
 func (s *Round2State) MarshalJSON() ([]byte, error) {
@@ -610,6 +666,7 @@ func (s *Round2State) MarshalJSON() ([]byte, error) {
 		CU:            scalarMapToHex(s.C_u),
 		CV:            scalarMapToHex(s.C_v),
 		Round1Commits: intMap32ToJSON(s.Round1Commits),
+		Round3Done:    s.round3Done.Load(),
 	})
 }
 
@@ -633,6 +690,7 @@ func (s *Round2State) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	s.Round1Commits, err = jsonToIntMap32(j.Round1Commits)
+	s.round3Done.Store(j.Round3Done)
 	return err
 }
 
@@ -812,12 +870,86 @@ type signerSetupJSON struct {
 	Share       string                     `json:"share"`
 	PubKey      string                     `json:"pub_key"`
 	Threshold   int                        `json:"threshold"`
-	VoleAlice   map[string]*VOLEAliceState `json:"vole_alice"`
-	VoleBob     map[string]*VOLEBobState   `json:"vole_bob"`
+	BaseOT      map[string]*BaseOTMaterial `json:"base_ot"`
 	FZeroSeeds  map[string]string          `json:"fzero_seeds"`
 	Blacklist   map[string]bool            `json:"blacklist"`
 	Epoch       int                        `json:"epoch"`
 	SignCounter uint64                     `json:"sign_counter"`
+
+	// Legacy fields, decode-only. A setup written before per-session VOLE stored the
+	// long-lived correlations here and did not retain the base OT they were derived
+	// from, so such a blob cannot be upgraded in place — it must be re-paired. These
+	// exist only so UnmarshalJSON can say that clearly instead of silently producing
+	// a setup with no base OT.
+	LegacyVoleAlice json.RawMessage `json:"vole_alice,omitempty"`
+	LegacyVoleBob   json.RawMessage `json:"vole_bob,omitempty"`
+}
+
+// baseOTMaterialJSON hex-encodes the seed vectors, matching how every other secret in
+// this file is serialized.
+type baseOTMaterialJSON struct {
+	BobSeeds0  []string `json:"bob_seeds0"`
+	BobSeeds1  []string `json:"bob_seeds1"`
+	AliceSeeds []string `json:"alice_seeds"`
+	Sigma      []bool   `json:"sigma"`
+}
+
+func hexSeeds(seeds [][]byte) []string {
+	out := make([]string, len(seeds))
+	for i, s := range seeds {
+		out[i] = hex.EncodeToString(s)
+	}
+	return out
+}
+
+func unhexSeeds(in []string, field string) ([][]byte, error) {
+	out := make([][]byte, len(in))
+	for i, s := range in {
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			return nil, fmt.Errorf("BaseOTMaterial.%s[%d]: %w", field, i, err)
+		}
+		out[i] = b
+	}
+	return out, nil
+}
+
+func (m *BaseOTMaterial) MarshalJSON() ([]byte, error) {
+	return json.Marshal(baseOTMaterialJSON{
+		BobSeeds0:  hexSeeds(m.BobSeeds0),
+		BobSeeds1:  hexSeeds(m.BobSeeds1),
+		AliceSeeds: hexSeeds(m.AliceSeeds),
+		Sigma:      m.Sigma,
+	})
+}
+
+func (m *BaseOTMaterial) UnmarshalJSON(data []byte) error {
+	var j baseOTMaterialJSON
+	if err := json.Unmarshal(data, &j); err != nil {
+		return err
+	}
+	var err error
+	if m.BobSeeds0, err = unhexSeeds(j.BobSeeds0, "BobSeeds0"); err != nil {
+		return err
+	}
+	if m.BobSeeds1, err = unhexSeeds(j.BobSeeds1, "BobSeeds1"); err != nil {
+		return err
+	}
+	if m.AliceSeeds, err = unhexSeeds(j.AliceSeeds, "AliceSeeds"); err != nil {
+		return err
+	}
+	m.Sigma = j.Sigma
+	// Shape is validated on the way in, not at first use: a setup that decodes but
+	// cannot sign is a much worse failure mode than one that refuses to decode.
+	if len(m.BobSeeds0) != LambdaC || len(m.BobSeeds1) != LambdaC ||
+		len(m.AliceSeeds) != LambdaC || len(m.Sigma) != LambdaC {
+		return &CorruptStateError{
+			Phase: "SignerSetup.UnmarshalJSON",
+			Detail: fmt.Sprintf("base OT material has lengths %d/%d/%d/%d, want %d each",
+				len(m.BobSeeds0), len(m.BobSeeds1), len(m.AliceSeeds), len(m.Sigma), LambdaC),
+		}
+	}
+	return nil
 }
 
 func (s *SignerSetup) MarshalJSON() ([]byte, error) {
@@ -831,8 +963,7 @@ func (s *SignerSetup) MarshalJSON() ([]byte, error) {
 		Share:       scalarToHex(&s.Share),
 		PubKey:      hex.EncodeToString(s.PubKey),
 		Threshold:   s.Threshold,
-		VoleAlice:   intMapKeys(s.VoleAlice),
-		VoleBob:     intMapKeys(s.VoleBob),
+		BaseOT:      intMapKeys(s.BaseOT),
 		FZeroSeeds:  intMap16ToJSON(s.FZeroSeeds),
 		Blacklist:   bl,
 		Epoch:       s.Epoch,
@@ -860,11 +991,16 @@ func (s *SignerSetup) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
-	s.VoleAlice, err = stringMapKeys(j.VoleAlice)
-	if err != nil {
-		return err
+	if len(j.BaseOT) == 0 && (len(j.LegacyVoleAlice) > 0 || len(j.LegacyVoleBob) > 0) {
+		return &CorruptStateError{
+			Phase: "SignerSetup.UnmarshalJSON",
+			Detail: "setup was written before per-session VOLE and has no base OT material; " +
+				"it stores a long-lived VOLE correlation, which is a key-recovery break. " +
+				"Re-run pairing setup for this wallet (pairing is key-independent, so the " +
+				"share, public key and address are all preserved)",
+		}
 	}
-	s.VoleBob, err = stringMapKeys(j.VoleBob)
+	s.BaseOT, err = stringMapKeys(j.BaseOT)
 	if err != nil {
 		return err
 	}

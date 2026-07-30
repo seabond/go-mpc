@@ -19,11 +19,22 @@ func Commit(msg []byte) (com [32]byte, salt [SaltLen]byte, err error) {
 	if _, err = rand.Read(salt[:]); err != nil {
 		return
 	}
+	return commitWithSalt(msg, salt), salt, nil
+}
+
+// commitWithSalt is Commit with a caller-supplied salt.
+//
+// Signing round 1 needs it because Pi commits to a DIFFERENT message per
+// counterparty — the nonce point together with that pair's psi — while round 2
+// carries a single salt on the wire. Reusing one salt across those messages is
+// sound: FCom hides through the salt's entropy, not through a distinct salt per
+// message. The salt must still come from the CSPRNG, which is the caller's job.
+func commitWithSalt(msg []byte, salt [SaltLen]byte) (com [32]byte) {
 	h := sha256.New()
 	h.Write(msg)
 	h.Write(salt[:])
 	copy(com[:], h.Sum(nil))
-	return
+	return com
 }
 
 // Open verifies a hash commitment in constant time.

@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/btcsuite/btcd/btcec/v2"
@@ -32,19 +33,6 @@ func randomBools(t *testing.T, n int) []bool {
 		out[k] = (buf[k/8]>>(uint(k)%8))&1 == 1
 	}
 	return out
-}
-
-// randomBetaXi returns a random [Xi]bool.
-func randomBetaXi(t *testing.T) [Xi]bool {
-	t.Helper()
-	buf := make([]byte, (Xi+7)/8)
-	_, err := rand.Read(buf)
-	require.NoError(t, err)
-	var beta [Xi]bool
-	for j := 0; j < Xi; j++ {
-		beta[j] = (buf[j/8]>>(uint(j)%8))&1 == 1
-	}
-	return beta
 }
 
 // computeRx reconstructs R = sum(R_j) from round2 states and returns the x-coordinate mod q.
@@ -248,44 +236,149 @@ func TestSignBadRCommitment(t *testing.T) {
 	}
 }
 
-func TestSignSetupPairwise(t *testing.T) {
+func TestNewBaseOTMaterial(t *testing.T) {
 	t.Parallel()
-	// Direction i→j: j is base-OT sender, i is base-OT receiver (i becomes Alice)
+	// Direction i→j: j is base-OT sender, i is base-OT receiver, so i becomes VOLE Alice.
 	jPriv, jPub, err := BaseSenderRound1(LambdaC)
 	require.NoError(t, err)
-
 	mySigma := randomBools(t, LambdaC)
 	responses, aliceSeeds, err := BaseReceiverRound1(jPub, mySigma)
 	require.NoError(t, err)
-	jSeeds0, jSeeds1, err := BaseSenderFinalize(jPriv, jPub, responses)
+	// j's matching Bob half for THIS direction. i's Alice half pairs with this,
+	// not with i's own Bob half — those come from the other direction's base OT
+	// and share no seeds at all.
+	jBob0, jBob1, err := BaseSenderFinalize(jPriv, jPub, responses)
 	require.NoError(t, err)
 
-	theirBeta := randomBetaXi(t)
-	theirCorr, err := OTExtReceiverCorrections(jSeeds0, jSeeds1, theirBeta)
-	require.NoError(t, err)
-
-	// Direction j→i: i is base-OT sender, j is base-OT receiver (i becomes Bob)
+	// Direction j→i: i is base-OT sender, so i becomes VOLE Bob.
 	myPriv, myPub, err := BaseSenderRound1(LambdaC)
 	require.NoError(t, err)
-
 	theirSigma := randomBools(t, LambdaC)
 	responses2, _, err := BaseReceiverRound1(myPub, theirSigma)
 	require.NoError(t, err)
 	bobSeeds0, bobSeeds1, err := BaseSenderFinalize(myPriv, myPub, responses2)
 	require.NoError(t, err)
 
-	myBeta := randomBetaXi(t)
-	myCorr, err := OTExtReceiverCorrections(bobSeeds0, bobSeeds1, myBeta)
+	m, err := NewBaseOTMaterial(bobSeeds0, bobSeeds1, aliceSeeds, mySigma)
+	require.NoError(t, err)
+	require.Equal(t, LambdaC, len(m.BobSeeds0))
+	require.Equal(t, LambdaC, len(m.BobSeeds1))
+	require.Equal(t, LambdaC, len(m.AliceSeeds))
+	require.Equal(t, LambdaC, len(m.Sigma))
+
+	// The material must be usable to derive matching single-use VOLE states: Bob
+	// draws a fresh beta and publishes corrections, Alice expands against them.
+	//
+	// The two halves are paired ACROSS parties, which is the only pairing that
+	// exists in the protocol. Running Bob and Alice off one party's own material
+	// would pair two unrelated base OTs; it used to look like it worked because
+	// nothing checked the correlation, and the consistency check now refuses it.
+	jMaterial, err := NewBaseOTMaterial(jBob0, jBob1, aliceSeeds, mySigma)
 	require.NoError(t, err)
 
-	alice, bob, err := SignSetupPairwise(1, 2, bobSeeds0, aliceSeeds, mySigma, theirCorr, myCorr, myBeta)
+	bob, corrections, oteProof, err := freshBobForSession(testSID, jMaterial)
 	require.NoError(t, err)
-	require.NotNil(t, alice)
-	require.NotNil(t, bob)
-	require.False(t, alice.C_u.IsZero() && alice.C_v.IsZero(), "alice state should be initialized")
+	require.Equal(t, LambdaC, len(corrections))
 	require.False(t, bob.Chi.IsZero(), "bob chi should be initialized")
-	require.Equal(t, Xi, len(alice.Alpha0))
 	require.Equal(t, Xi, len(bob.Gamma))
+
+	alice, err := freshAliceForSession(testSID, m, corrections, oteProof)
+	require.NoError(t, err)
+	require.Equal(t, Xi, len(alice.Alpha0))
+}
+
+func TestNewBaseOTMaterialRejectsWrongLengths(t *testing.T) {
+	t.Parallel()
+	full := make([][]byte, LambdaC)
+	for i := range full {
+		full[i] = make([]byte, baseOTSeedLen)
+	}
+	sigma := make([]bool, LambdaC)
+
+	_, err := NewBaseOTMaterial(full[:LambdaC-1], full, full, sigma)
+	require.Error(t, err)
+	_, err = NewBaseOTMaterial(full, full[:1], full, sigma)
+	require.Error(t, err)
+	_, err = NewBaseOTMaterial(full, full, full[:0], sigma)
+	require.Error(t, err)
+	_, err = NewBaseOTMaterial(full, full, full, sigma[:LambdaC-1])
+	require.Error(t, err)
+}
+
+// A signing session must never reuse a VOLE correlation. Reuse makes Bob's chi
+// constant across sessions, at which point three transcripts determine the
+// counterparty's Shamir share by linear algebra. This test is the tripwire: if a
+// future change reintroduces a stored correlation, two sessions will start agreeing
+// and this fails.
+func TestSignDerivesFreshVOLEPerSession(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+
+	seenChi := map[string]bool{}
+	seenCorrections := map[string]bool{}
+	for session := 0; session < 3; session++ {
+		sigID := fmt.Sprintf("freshness-%d", session)
+		for _, id := range signers {
+			st, msgs, err := SignRound1(setups[id], sigID, signers)
+			require.NoError(t, err)
+			for peer, bob := range st.VoleBobForRound2 {
+				chi := bob.Chi.Bytes()
+				key := fmt.Sprintf("%d->%d:%x", peer, id, chi[:])
+				require.False(t, seenChi[key], "party %d reused chi toward %d across sessions", id, peer)
+				seenChi[key] = true
+			}
+			for peer, msg := range msgs {
+				require.Equal(t, LambdaC, len(msg.OTECorrections),
+					"party %d sent no OTE corrections to %d", id, peer)
+				key := fmt.Sprintf("%d->%d:%x", id, peer, msg.OTECorrections[0])
+				require.False(t, seenCorrections[key], "party %d reused corrections toward %d", id, peer)
+				seenCorrections[key] = true
+			}
+		}
+	}
+}
+
+// A counterparty that omits or truncates its corrections must abort the session, not
+// fall back to anything. A fallback path here would restore the reuse break under an
+// attacker-controllable condition.
+func TestSignRound2RejectsBadCorrections(t *testing.T) {
+	t.Parallel()
+	setups := fullSetup(t)
+	signers := []int{1, 2, 3}
+	sigID := "bad-corrections"
+
+	states := map[int]*Round1State{}
+	msgs := map[int]map[int]*Round1Msg{}
+	for _, id := range signers {
+		st, m, err := SignRound1(setups[id], sigID, signers)
+		require.NoError(t, err)
+		states[id] = st
+		msgs[id] = m
+	}
+
+	incoming := func(me int, mutate func(map[int]*Round1Msg)) map[int]*Round1Msg {
+		in := map[int]*Round1Msg{}
+		for _, j := range signers {
+			if j == me {
+				continue
+			}
+			src := msgs[j][me]
+			in[j] = &Round1Msg{Commitment: src.Commitment, OTECorrections: src.OTECorrections}
+		}
+		mutate(in)
+		return in
+	}
+
+	_, _, err := SignRound2(setups[1], states[1], incoming(1, func(in map[int]*Round1Msg) {
+		in[2].OTECorrections = nil
+	}))
+	require.Error(t, err, "missing corrections must abort")
+
+	_, _, err = SignRound2(setups[1], states[1], incoming(1, func(in map[int]*Round1Msg) {
+		in[2].OTECorrections = in[2].OTECorrections[:LambdaC-1]
+	}))
+	require.Error(t, err, "truncated corrections must abort")
 }
 
 func TestComputeRxFromDecommitments(t *testing.T) {

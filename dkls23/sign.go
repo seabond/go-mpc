@@ -1,6 +1,7 @@
 package dkls23
 
 import (
+	"crypto/rand"
 	"crypto/sha256"
 	"errors"
 	"fmt"
@@ -23,8 +24,10 @@ import (
 //   sum_i w_i = hash * phi + rx * sk * phi
 //   s = sum(w) / sum(u) = (hash + rx*sk) / R_scalar = standard ECDSA s.
 
-// SignerSetup holds per-signer persistent state initialized once during VOLE setup.
-// It is reused across multiple signing sessions.
+// SignerSetup holds per-signer persistent state initialized once during pairing setup.
+// It is reused across signing sessions, but note carefully WHAT is reused: the Shamir
+// share, the FZero seeds, and the base OT. The VOLE correlations built on top of the
+// base OT are single-use and never live here — see BaseOTMaterial for why.
 //
 // SignerSetup is safe for concurrent use: read-only operations (signing) acquire
 // a read lock, while mutating operations (refresh, blacklisting) acquire a write lock.
@@ -43,10 +46,10 @@ type SignerSetup struct {
 	PubKey []byte
 	// Threshold is the signing threshold t.
 	Threshold int
-	// VoleAlice[j] is the VOLE state where I am Alice and j is Bob (i→j direction).
-	VoleAlice map[int]*VOLEAliceState
-	// VoleBob[j] is the VOLE state where j is Alice and I am Bob (j→i direction).
-	VoleBob map[int]*VOLEBobState
+	// BaseOT[j] holds the reusable base-OT outputs shared with party j. The VOLE
+	// correlations themselves are NOT stored here: they are derived fresh for every
+	// signing session from this material. See BaseOTMaterial.
+	BaseOT map[int]*BaseOTMaterial
 	// FZeroSeeds[j] is the shared FZero seed between this party and party j.
 	FZeroSeeds map[int][16]byte
 	// Blacklist records parties detected cheating; they are excluded from future sessions.
@@ -54,66 +57,141 @@ type SignerSetup struct {
 	// Epoch is the proactive refresh epoch counter, starting at 0 and incremented on each RefreshFinalize.
 	Epoch int
 	// SignCounter is a monotonic counter incremented on each SignRound1 call.
-	// It guards against VOLE correlation reuse after state snapshot rollback:
-	// if a restored SignerSetup has a lower counter than expected, the VOLE
-	// state may have already been consumed by a prior signing session.
+	// It exists so an operator can notice a state-snapshot rollback: a restored
+	// SignerSetup with a lower counter than expected has lost signing history.
+	//
+	// It is NOT what prevents VOLE correlation reuse — nothing stored here is
+	// reused across sessions any more, so a rollback replays no correlation. The
+	// counter is a detection signal, and go-mpc does not enforce it; a caller that
+	// wants rollback detection must compare it itself.
 	SignCounter uint64
 }
 
-// SignSetupPairwise assembles a VOLE Alice/Bob state pair from already-exchanged OTE material.
-// The caller is responsible for running the base OT and OTE correction exchange before calling this.
+// BaseOTMaterial holds one party's half of the base OT run against a single
+// counterparty, in both directions. It is the ONLY long-lived pairwise secret the
+// signing protocol keeps.
 //
-// Parameters:
-//   - bobSeeds0: Bob (my side) base OT sender seeds K^0_k for k∈[LambdaC].
-//   - aliceSeeds: Alice (my side) base OT receiver seeds K^{sigma_k}_k.
-//   - mySigma: Alice's base OT choice bits (sigma).
-//   - theirCorrections: corrections sent by the other party's Bob for the i→j direction.
-//   - myCorrections: corrections I sent as Bob for the j→i direction.
-//   - myBeta: my OTE receiver input beta for the j→i direction.
-func SignSetupPairwise(
-	myID, theirID int,
-	bobSeeds0 [][]byte,
-	aliceSeeds [][]byte,
-	mySigma []bool,
-	theirCorrections [][Xi / 8]byte,
-	myCorrections [][Xi / 8]byte,
-	myBeta [Xi]bool,
-) (alice *VOLEAliceState, bob *VOLEBobState, err error) {
-	secretdo.Do(func() {
-		alice, bob, err = signSetupPairwise(myID, theirID, bobSeeds0, aliceSeeds, mySigma, theirCorrections, myCorrections, myBeta)
-	})
-	return
+// Why this exists instead of a stored VOLEAliceState/VOLEBobState: the RVOLE of
+// Protocol 5.2 supplies Ell=2 inputs PER SIGNING SESSION and its correlation must be
+// fresh each time. A stored correlation makes Bob's beta — and therefore
+// chi = GadgetInnerProduct(beta) — a constant across sessions, at which point each
+// session's round-3 fragment is an affine equation in the same two unknowns
+// (the counterparty's chi and its Shamir share). Three sessions then give a 3x3
+// linear system over Zq with an exact solution, so a single honest-looking party
+// recovers its counterparty's share and reconstructs the group private key. Do not
+// reintroduce a persisted VOLE state as an optimisation.
+//
+// Base OT, by contrast, is legitimately reusable: IKNP extends a fixed set of base
+// OTs into arbitrarily many extended OTs, and only the extension must be fresh. That
+// is also the cheap half — the base OT costs ~40ms while a fresh extension costs
+// ~2.6ms, so per-session freshness is affordable.
+type BaseOTMaterial struct {
+	// BobSeeds0 and BobSeeds1 are the base-OT SENDER seed pairs (K^0_k, K^1_k) for
+	// k∈[LambdaC], used when I act as the OTE receiver — i.e. VOLE Bob, the party
+	// holding beta — toward this counterparty.
+	BobSeeds0 [][]byte
+	BobSeeds1 [][]byte
+	// AliceSeeds are the base-OT RECEIVER seeds K^{sigma_k}_k and Sigma the matching
+	// choice bits, used when I act as the OTE sender — i.e. VOLE Alice — toward this
+	// counterparty.
+	AliceSeeds [][]byte
+	Sigma      []bool
 }
 
-func signSetupPairwise(
-	myID, theirID int,
-	bobSeeds0 [][]byte,
-	aliceSeeds [][]byte,
-	mySigma []bool,
-	theirCorrections [][Xi / 8]byte,
-	myCorrections [][Xi / 8]byte,
-	myBeta [Xi]bool,
-) (alice *VOLEAliceState, bob *VOLEBobState, err error) {
-	// Alice direction: I am Alice (OTE sender), other party is Bob.
-	alpha0, alpha1, err := OTExtSenderExpand(aliceSeeds, mySigma, theirCorrections)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 SignSetupPairwise [alice]: %w", err)
+// sampleBeta draws a fresh OTE receiver input for one signing session.
+//
+// This MUST come from the CSPRNG. Deriving it from sigID, an epoch counter, or any
+// seed shared with the counterparty would make it predictable to exactly the party it
+// must be hidden from, which restores the correlation-reuse break in full.
+func sampleBeta() (beta [Xi]bool, err error) {
+	buf := make([]byte, (Xi+7)/8)
+	if _, err = rand.Read(buf); err != nil {
+		return beta, fmt.Errorf("dkls23 sampleBeta: %w", err)
 	}
-	alice, err = VOLEAliceSetup(alpha0, alpha1)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 SignSetupPairwise [alice setup]: %w", err)
+	for j := 0; j < Xi; j++ {
+		beta[j] = (buf[j/8]>>(uint(j)%8))&1 == 1
 	}
+	return beta, nil
+}
 
-	// Bob direction: I am Bob (OTE receiver), other party is Alice.
-	gamma, err := OTExtReceiverExpand(bobSeeds0, myBeta, myCorrections)
+// freshBobForSession derives a single-use VOLE Bob state, plus the OTE corrections
+// that must be handed to the counterparty so it can derive the matching Alice state.
+//
+// sid is the DIRECTED-pair session id for the direction in which this party is
+// Bob. It must equal the sid the counterparty uses as Alice for the same
+// direction, or the correlation will not cancel. Both sides derive it from
+// voleSIDForPair, so they agree by construction.
+//
+// Passing sid is not bookkeeping: without it the OT extension expands a fixed
+// base-OT seed to a fixed pad, and a fresh beta only re-selects among those
+// fixed pads. See prg in ot_extension.go for what that costs.
+func freshBobForSession(sid string, m *BaseOTMaterial) (*VOLEBobState, [][Xi / 8]byte, oteConsistencyProof, error) {
+	beta, err := sampleBeta()
 	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 SignSetupPairwise [bob]: %w", err)
+		return nil, nil, oteConsistencyProof{}, err
 	}
-	bob, err = VOLEBobSample(gamma, myBeta)
+	corrections, proof, err := OTExtReceiverCorrections(sid, m.BobSeeds0, m.BobSeeds1, beta)
 	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 SignSetupPairwise [bob sample]: %w", err)
+		return nil, nil, oteConsistencyProof{}, fmt.Errorf("dkls23 freshBobForSession: corrections: %w", err)
 	}
-	return
+	gamma, err := OTExtReceiverExpand(sid, m.BobSeeds0, beta, corrections)
+	if err != nil {
+		return nil, nil, oteConsistencyProof{}, fmt.Errorf("dkls23 freshBobForSession: expand: %w", err)
+	}
+	bob, err := VOLEBobSample(gamma, beta)
+	if err != nil {
+		return nil, nil, oteConsistencyProof{}, fmt.Errorf("dkls23 freshBobForSession: sample: %w", err)
+	}
+	return bob, corrections, proof, nil
+}
+
+// freshAliceForSession derives a single-use VOLE Alice state from the corrections the
+// counterparty produced as Bob for this session.
+func freshAliceForSession(sid string, m *BaseOTMaterial, theirCorrections [][Xi / 8]byte, proof oteConsistencyProof) (*VOLEAliceState, error) {
+	alpha0, alpha1, err := OTExtSenderExpand(sid, m.AliceSeeds, m.Sigma, theirCorrections, proof)
+	if err != nil {
+		return nil, fmt.Errorf("dkls23 freshAliceForSession: expand: %w", err)
+	}
+	alice, err := VOLEAliceSetup(alpha0, alpha1)
+	if err != nil {
+		return nil, fmt.Errorf("dkls23 freshAliceForSession: setup: %w", err)
+	}
+	return alice, nil
+}
+
+// NewBaseOTMaterial assembles one party's reusable base-OT state toward one
+// counterparty and validates its shape. It replaces the former SignSetupPairwise,
+// which assembled a long-lived VOLE correlation — the thing that must no longer
+// exist.
+//
+// The caller runs the two directed base OTs and supplies both halves. Note IKNP's
+// role reversal: the base-OT *sender* becomes the OTE *receiver* (VOLE Bob, the side
+// holding beta), and the base-OT *receiver* becomes the OTE *sender* (VOLE Alice).
+//
+// Parameters:
+//   - bobSeeds0, bobSeeds1: base-OT sender seed pairs (K^0_k, K^1_k) from the base OT
+//     in which I was the sender. Used when I am VOLE Bob toward this counterparty.
+//   - aliceSeeds, sigma: base-OT receiver seeds K^{sigma_k}_k and the matching choice
+//     bits, from the base OT in which I was the receiver. Used when I am VOLE Alice.
+func NewBaseOTMaterial(bobSeeds0, bobSeeds1, aliceSeeds [][]byte, sigma []bool) (*BaseOTMaterial, error) {
+	if len(bobSeeds0) != LambdaC || len(bobSeeds1) != LambdaC {
+		return nil, &InvalidInputError{
+			Phase:  "NewBaseOTMaterial",
+			Detail: fmt.Sprintf("bob seeds must have %d entries, got %d/%d", LambdaC, len(bobSeeds0), len(bobSeeds1)),
+		}
+	}
+	if len(aliceSeeds) != LambdaC || len(sigma) != LambdaC {
+		return nil, &InvalidInputError{
+			Phase:  "NewBaseOTMaterial",
+			Detail: fmt.Sprintf("alice seeds and sigma must have %d entries, got %d/%d", LambdaC, len(aliceSeeds), len(sigma)),
+		}
+	}
+	return &BaseOTMaterial{
+		BobSeeds0:  bobSeeds0,
+		BobSeeds1:  bobSeeds1,
+		AliceSeeds: aliceSeeds,
+		Sigma:      sigma,
+	}, nil
 }
 
 // voleSIDForPair constructs a deterministic VOLE session ID from signing session ID and party pair.
@@ -133,21 +211,45 @@ type Round1State struct {
 	Phi_i btcec.ModNScalar
 	// R_iPoint is R_i*G (33-byte compressed).
 	R_iPoint []byte
-	// Com is FCom commitment to R_iPoint.
-	Com [32]byte
-	// Salt is the FCom salt for Com.
+	// Com[j] is the FCom commitment Pi sends to Pj, over R_iPoint || Psi[j]. It is
+	// keyed by counterparty because psi is pairwise; see signRound1 for why psi is
+	// inside the commitment at all.
+	Com map[int][32]byte
+	// Salt is the FCom salt, shared by every entry of Com.
 	Salt [SaltLen]byte
+	// Psi[j] is psi_{i,j} = phi_i - chi_{j->i} mod q, the value round 2 sends to
+	// Pj. It is fixed here in round 1 — both inputs are round-1 quantities — which
+	// is what makes it committable before it is ever sent.
+	Psi map[int][32]byte
 	// ZetaI is Pi's FZero zero-sharing value for this session.
 	ZetaI btcec.ModNScalar
 	// VoleBobForRound2 holds Pi's VOLE Bob state per counterparty j (Pi is Bob, j is Alice).
 	// Used in round 3 to run VOLEBobReceive against j's VOLE multiply message.
 	VoleBobForRound2 map[int]*VOLEBobState
+	// round2Done marks the state spent, exactly as round3Done does for Round2State.
+	// Unexported so no caller can clear it, and carried through the JSON encoding
+	// so a state that is persisted and restored stays spent.
+	round2Done atomic.Bool
 }
 
 // Round1Msg is Pi's round 1 broadcast/send to each counterparty.
 type Round1Msg struct {
 	// Commitment is FCom commitment to R_i*G; sent to all counterparties.
 	Commitment [32]byte
+	// OTECorrections are Pi's IKNP correction vectors for THIS session, computed as
+	// the OTE receiver (VOLE Bob) in the j→i direction. Pj feeds them to
+	// OTExtSenderExpand to derive its matching single-use VOLE Alice state.
+	//
+	// These are per-recipient, not broadcast: each counterparty gets corrections
+	// derived from an independently sampled beta.
+	OTECorrections [][Xi / 8]byte
+	// OTECheckT and OTECheckX are the OT-extension consistency proof for the
+	// corrections above: sum_j chi_j*t^j and sum_j chi_j*beta_j over GF(2^128).
+	// They travel with the corrections because they are what makes them usable —
+	// the recipient refuses corrections it cannot check, so this is not an
+	// optional annex to the message.
+	OTECheckT [16]byte
+	OTECheckX [16]byte
 }
 
 // checkBlacklist returns a BlacklistedPartyError if any of the given party IDs
@@ -168,7 +270,35 @@ func checkBlacklist(setup *SignerSetup, partyIDs []int, phase string) error {
 // SignRound1 executes round 1 of the threshold signing protocol (paper §3.6, step 1).
 // Pi samples r_i, phi_i, computes R_i = r_i*G and commits to it.
 // Pi also computes its FZero zero-sharing value zeta_i.
-// The pre-shared VoleBob states are used as-is (they were set up during pairing setup).
+//
+// Pi also derives a SINGLE-USE VOLE Bob correlation per counterparty from the
+// reusable base OT, and publishes the resulting OTE corrections in its round 1
+// message. The correlation is never carried over from a previous session; see
+// BaseOTMaterial for what goes wrong when it is.
+//
+// THE CALLER MUST NEVER REPEAT A sigID FOR A GIVEN SETUP. This is not hygiene,
+// and this function cannot enforce it.
+//
+// sigID is the only input that makes the OT-extension pads fresh: they are
+// prg(voleSIDForPair(sigID, ...), base-OT seed), and the base OT is reused with
+// a peer by design. Two sessions under one sigID therefore share pads at every
+// index where the freshly sampled beta agrees — half of them — and the
+// counterparty, which chose both betas, knows exactly which. Subtracting the two
+// aTilde matrices cancels the pads and yields the difference of this party's
+// nonce shares; two ECDSA signatures with a known nonce difference give up the
+// private key. TestReusingASigIDLeaksTheNonceDifference demonstrates it.
+//
+// Enforcement has to be durable and therefore belongs to the caller. A
+// SignerSetup is unsealed fresh per call from storage, so an in-memory guard on
+// it can never fire, and a process restart would clear one while leaving the
+// share on disk exactly as it was. Making sigID contributory instead would need
+// both parties' fresh nonces before the corrections are built — but the
+// corrections ARE round 1, so Bob computes his before Alice's round 1 arrives.
+// That is a protocol restructure, not a check.
+//
+// A caller holding real funds should record every sigID it has used, per setup,
+// permanently, in the same transaction that consumes it. See the vault's
+// claimSigID for one that does.
 func SignRound1(setup *SignerSetup, sigID string, signers []int) (state *Round1State, msgs map[int]*Round1Msg, err error) {
 	secretdo.Do(func() {
 		state, msgs, err = signRound1(setup, sigID, signers)
@@ -217,10 +347,13 @@ func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 		return nil, nil, fmt.Errorf("dkls23 SignRound1: R_i: %w", err)
 	}
 
-	// Commit to R_i.
-	com, salt, err := Commit(R_iPoint)
-	if err != nil {
-		return nil, nil, fmt.Errorf("dkls23 SignRound1: commit: %w", err)
+	// One FCom salt for every per-counterparty commitment below. The commitments
+	// differ (each covers that pair's psi) but round 2 carries a single salt, and
+	// hiding comes from the salt's entropy rather than from a fresh salt per
+	// message.
+	var salt [SaltLen]byte
+	if _, err := rand.Read(salt[:]); err != nil {
+		return nil, nil, fmt.Errorf("dkls23 SignRound1: salt: %w", err)
 	}
 
 	// FZero sample: restrict seeds to this signing session's counterparties.
@@ -235,22 +368,59 @@ func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 	}
 	zetaI := FZeroSample(signerSeeds, setup.MyID, []byte(sigID))
 
-	// Collect VOLE Bob states for each counterparty.
+	// Derive a SINGLE-USE VOLE Bob correlation per counterparty from the reusable
+	// base OT, and ship the resulting OTE corrections in this round's message so the
+	// counterparty can derive its matching Alice state in round 2. Reusing one
+	// correlation across sessions is a key-recovery break — see BaseOTMaterial.
+	//
+	// This rides on round 1, which already sends a message to every counterparty, so
+	// per-session freshness costs no extra round trip.
 	bobStates := make(map[int]*VOLEBobState)
-	for _, j := range signers {
-		if j == setup.MyID {
-			continue
-		}
-		bobStates[j] = setup.VoleBob[j]
-	}
-
-	// Build outgoing round 1 messages (FCom commitment broadcast).
+	psis := make(map[int][32]byte)
+	coms := make(map[int][32]byte)
 	outMsgs := make(map[int]*Round1Msg)
 	for _, j := range signers {
 		if j == setup.MyID {
 			continue
 		}
-		outMsgs[j] = &Round1Msg{Commitment: com}
+		material := setup.BaseOT[j]
+		if material == nil {
+			return nil, nil, &CorruptStateError{
+				Phase:  "SignRound1",
+				Detail: fmt.Sprintf("missing base OT material for party %d", j),
+			}
+		}
+		bob, corrections, oteProof, err := freshBobForSession(voleSIDForPair(sigID, j, setup.MyID), material)
+		if err != nil {
+			return nil, nil, fmt.Errorf("dkls23 SignRound1: fresh VOLE Bob for %d: %w", j, err)
+		}
+		bobStates[j] = bob
+
+		// psi_{i,j} = phi_i - chi_{j->i} mod q is already determined: phi_i was
+		// sampled above and chi comes out of Pi's own Bob state. Commit to it here,
+		// alongside R_i, so that the value round 2 puts on the wire is BOUND before
+		// anything from another party has been seen.
+		//
+		// Without that binding psi is just attacker-chosen bytes by the time round 3
+		// folds it into eff_phi, and round 3 becomes an oracle: run it twice with
+		// psi and psi', and (u_i - u_i')/(psi - psi') = r_i while
+		// (w_i - w_i')/(psi - psi') = rx*sk_i. That recovers the party's
+		// rerandomized share, and summed over the signers, the group private key.
+		// A relay that holds no share at all can do it.
+		var negChi, psi btcec.ModNScalar
+		negChi.NegateVal(&bob.Chi)
+		psi.Add2(&phi_i, &negChi)
+		psiArr := psi.Bytes()
+		psis[j] = psiArr
+
+		com := commitWithSalt(commitMsgForPeer(R_iPoint, psiArr[:]), salt)
+		coms[j] = com
+		outMsgs[j] = &Round1Msg{
+			Commitment:     com,
+			OTECorrections: corrections,
+			OTECheckT:      oteProof.TTilde,
+			OTECheckX:      oteProof.XTilde,
+		}
 	}
 
 	state := &Round1State{
@@ -259,17 +429,45 @@ func signRound1(setup *SignerSetup, sigID string, signers []int) (*Round1State, 
 		R_i:              r_i,
 		Phi_i:            phi_i,
 		R_iPoint:         R_iPoint,
-		Com:              com,
+		Com:              coms,
 		Salt:             salt,
+		Psi:              psis,
 		ZetaI:            zetaI,
 		VoleBobForRound2: bobStates,
 	}
 	return state, outMsgs, nil
 }
 
+// Round-1 commitment message widths. They are enforced before Open because a
+// hash over a concatenation only binds the pair if the split is unambiguous:
+// unchecked, a peer could move bytes across the boundary and open the same
+// commitment to a different (R_j, psi) pair, which is the whole point of the
+// commitment.
+const (
+	compressedPointLen = 33
+	psiLen             = 32
+)
+
+// commitMsgForPeer is the byte string Pi commits to in round 1 for one
+// counterparty: its nonce point followed by that pair's psi.
+func commitMsgForPeer(rPoint, psi []byte) []byte {
+	msg := make([]byte, 0, len(rPoint)+len(psi))
+	msg = append(msg, rPoint...)
+	msg = append(msg, psi...)
+	return msg
+}
+
 // Round2State holds Pi's private state after signing round 2.
+//
+// It is SINGLE-USE: exactly one SignRound3 may consume it. See signRound3 for
+// what a second one hands the caller. A Round2State must not be copied after
+// first use.
 type Round2State struct {
 	*Round1State
+	// round3Done marks the state spent. Unexported so no caller can clear it, but
+	// carried through the JSON encoding so a state that is persisted and restored
+	// stays spent — a rollback must not resurrect a used one.
+	round3Done atomic.Bool
 	// SK_i is Pi's rerandomized Shamir share: share*lagrange(signers,myID,0) + zeta_i mod q.
 	SK_i btcec.ModNScalar
 	// C_u[j] is Pi's VOLE Alice output share for the nonce correlation with Pj.
@@ -294,6 +492,10 @@ type Round2Msg struct {
 	GammaV []byte
 	// Psi = phi_i - chi_{j->i} mod q (32 bytes big-endian); used for inversion.
 	// chi_{j->i} is the VOLE Bob chi where Pi is Bob and Pj is Alice.
+	//
+	// It is covered by the round 1 commitment together with Decommitment, so the
+	// recipient verifies it rather than trusting it. It reaches round 3 through
+	// whatever relays the ceremony, and round 3 folds it straight into eff_phi.
 	Psi []byte
 	// PKi = sk_i*G (compressed 33 bytes); for public key consistency check.
 	PKi []byte
@@ -310,6 +512,27 @@ func SignRound2(setup *SignerSetup, r1state *Round1State, allRound1 map[int]*Rou
 }
 
 func signRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round1Msg) (*Round2State, map[int]*Round2Msg, error) {
+	// A Round1State is single-use, for the same reason a Round2State is, and the
+	// consequence of missing it here is worse.
+	//
+	// Round 2 runs the OTE sender expansion over corrections the COUNTERPARTY
+	// supplies, against this party's long-lived base-OT choice vector sigma. Alice's
+	// pad in column j changes under a flipped correction bit exactly when
+	// sigma[j] = 1, and aTilde carries the difference. Run round 2 twice on one
+	// Round1State — same r_i, same sk_i, same sigma — and comparing the two aTilde
+	// matrices reads sigma off directly: 128 bits from two calls, no error.
+	//
+	// sigma is not session material. It lives in BaseOTMaterial and is reused with
+	// that peer forever, so this is not a leak within one signature but the
+	// permanent loss of the pairwise OT setup. Marked spent on ENTRY, before any
+	// check that could fail, so a rejected attempt buys no retry.
+	if !state.round2Done.CompareAndSwap(false, true) {
+		return nil, nil, &InvalidInputError{
+			Phase:  "SignRound2",
+			Detail: fmt.Sprintf("round 2 already ran for session %q: a Round1State is single-use", state.SigID),
+		}
+	}
+
 	setup.mu.RLock()
 	defer setup.mu.RUnlock()
 	if err := checkBlacklist(setup, state.Signers, "SignRound2"); err != nil {
@@ -340,10 +563,32 @@ func signRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 		}
 
 		// Record j's round 1 commitment for later verification in round 3.
-		round1Commits[j] = allRound1[j].Commitment
+		msg1 := allRound1[j]
+		if msg1 == nil {
+			return nil, nil, &CorruptStateError{Phase: "SignRound2", Detail: fmt.Sprintf("missing round 1 message from party %d", j)}
+		}
+		round1Commits[j] = msg1.Commitment
 
-		// Pi is Alice in the i→j VOLE direction.
-		aliceState := setup.VoleAlice[j]
+		// Pi is Alice in the i→j VOLE direction. The correlation is derived fresh for
+		// this session from j's round-1 corrections; there is deliberately no stored
+		// Alice state to fall back on, because reusing one would be a key-recovery
+		// break (see BaseOTMaterial). A missing or malformed correction vector must
+		// therefore abort, never degrade.
+		material := setup.BaseOT[j]
+		if material == nil {
+			return nil, nil, &CorruptStateError{Phase: "SignRound2", Detail: fmt.Sprintf("missing base OT material for party %d", j)}
+		}
+		if len(msg1.OTECorrections) != LambdaC {
+			return nil, nil, &InvalidInputError{
+				Phase:  "SignRound2",
+				Detail: fmt.Sprintf("party %d sent %d OTE correction vectors, want %d", j, len(msg1.OTECorrections), LambdaC),
+			}
+		}
+		aliceState, err := freshAliceForSession(voleSIDForPair(state.SigID, setup.MyID, j), material,
+			msg1.OTECorrections, oteConsistencyProof{TTilde: msg1.OTECheckT, XTilde: msg1.OTECheckX})
+		if err != nil {
+			return nil, nil, fmt.Errorf("dkls23 SignRound2: fresh VOLE Alice for %d: %w", j, err)
+		}
 		sid := voleSIDForPair(state.SigID, setup.MyID, j)
 		cu, cv, voleMsg, err := VOLEAliceMultiply(aliceState, sid, &state.R_i, &sk_i)
 		if err != nil {
@@ -362,18 +607,16 @@ func signRound2(setup *SignerSetup, state *Round1State, allRound1 map[int]*Round
 			return nil, nil, fmt.Errorf("dkls23 SignRound2: GammaV for %d: %w", j, err)
 		}
 
-		// psi_{i,j} = phi_i - chi_{j->i} mod q.
-		// chi_{j->i} is from the VOLE Bob state where Pi is Bob and j is Alice.
-		bobStateJI := state.VoleBobForRound2[j]
-		if bobStateJI == nil {
+		// psi_{i,j} was fixed and committed to in round 1. Sending the stored value
+		// rather than recomputing it is what makes "what was committed" and "what
+		// was sent" the same object by construction.
+		psiArr, ok := state.Psi[j]
+		if !ok {
+			return nil, nil, &CorruptStateError{Phase: "SignRound2", Detail: fmt.Sprintf("missing psi for party %d", j)}
+		}
+		if state.VoleBobForRound2[j] == nil {
 			return nil, nil, &CorruptStateError{Phase: "SignRound2", Detail: fmt.Sprintf("missing VOLE Bob state for party %d", j)}
 		}
-		chiJI := bobStateJI.Chi
-		var psi btcec.ModNScalar
-		var negChi btcec.ModNScalar
-		negChi.NegateVal(&chiJI)
-		psi.Add2(&state.Phi_i, &negChi)
-		psiArr := psi.Bytes()
 
 		outMsgs[j] = &Round2Msg{
 			Decommitment: state.R_iPoint,
@@ -430,6 +673,23 @@ func SignRound3Prehashed(setup *SignerSetup, state2 *Round2State, msgHash [32]by
 }
 
 func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRound2 map[int]*Round2Msg) (map[int]*Round3Msg, error) {
+	// Round 3 is single-shot per Round2State. A second run is a key-recovery
+	// break, not a protocol nuisance: eff_phi folds in the counterparties' psi
+	// values, so a caller that runs round 3 twice with psi and then psi' gets
+	// (u_i - u_i')/(psi - psi') = r_i and (w_i - w_i')/(psi - psi') = rx*sk_i.
+	// That is this party's nonce and its rerandomized share; summed over the
+	// signers it is the group private key.
+	//
+	// Marked spent on ENTRY, before any check that could fail, so a rejected
+	// attempt buys no retry. The fragments are what must never exist twice for one
+	// nonce, and a caller that wants another signature must run a new session.
+	if !state2.round3Done.CompareAndSwap(false, true) {
+		return nil, &InvalidInputError{
+			Phase:  "SignRound3",
+			Detail: fmt.Sprintf("round 3 already ran for session %q: a Round2State is single-use", state2.SigID),
+		}
+	}
+
 	setup.mu.Lock()
 	defer setup.mu.Unlock()
 	if err := checkBlacklist(setup, state2.Signers, "SignRound3"); err != nil {
@@ -471,9 +731,20 @@ func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRo
 			continue
 		}
 
-		// Step 1: Verify FCom decommitment of R_j.
+		// Step 1: Verify the FCom decommitment of R_j AND of psi_{j,i}, which round 1
+		// committed to as one message. psi is otherwise unauthenticated bytes that a
+		// relay can rewrite on their way here, and eff_phi below adds them in
+		// unconditionally; opening them against the round 1 commitment is what turns
+		// a rewrite into an abort instead of a silently different signature.
+		//
+		// The widths are checked first so the concatenation cannot be re-split.
+		if len(r2j.Decommitment) != compressedPointLen || len(r2j.Psi) != psiLen {
+			badParties = append(badParties, j)
+			setup.Blacklist[j] = true
+			continue
+		}
 		comJ := state2.Round1Commits[j]
-		if err := Open(r2j.Decommitment, comJ, r2j.Salt); err != nil {
+		if err := Open(commitMsgForPeer(r2j.Decommitment, r2j.Psi), comJ, r2j.Salt); err != nil {
 			badParties = append(badParties, j)
 			setup.Blacklist[j] = true
 			continue
@@ -494,6 +765,17 @@ func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRo
 			continue
 		}
 		pkjPoints[j] = pkj
+
+		// A relay can strip vole_msg from an otherwise genuine round 2 message and
+		// the round 1 commitment will not notice: it covers R_j and psi, not this.
+		// A missing multiply message is a party failing to play its part, which is
+		// what the blacklist is for — it must not be a nil dereference that takes
+		// the node down instead.
+		if r2j.VoleMsg == nil {
+			badParties = append(badParties, j)
+			setup.Blacklist[j] = true
+			continue
+		}
 
 		// Step 2: VOLE Bob receive. Pi is Bob in the j→i VOLE direction.
 		bobState := state2.VoleBobForRound2[j]
@@ -594,6 +876,9 @@ func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRo
 	rx.SetByteSlice(rxBytes)
 
 	// eff_phi_i = phi_i + sum_{j∈signers, j≠i} psi_{j,i}
+	//
+	// Every psi added here has been opened against j's round 1 commitment above, so
+	// this is j's committed value and not whatever arrived on the wire.
 	var effPhi btcec.ModNScalar
 	effPhi.Set(&state2.Phi_i)
 	for _, j := range state2.Signers {
@@ -602,7 +887,12 @@ func signRound3(setup *SignerSetup, state2 *Round2State, msgHash [32]byte, allRo
 		}
 		r2j := allRound2[j]
 		var psiJI btcec.ModNScalar
-		psiJI.SetByteSlice(r2j.Psi)
+		if psiJI.SetByteSlice(r2j.Psi) {
+			// Honest psi is q-reduced by construction, so an overflowing one means the
+			// committer chose a non-canonical encoding. Reducing it silently would let
+			// two encodings satisfy one commitment.
+			return nil, &CheatingPartyError{PartyIDs: []int{j}, Phase: "SignRound3", Detail: "psi is not a canonical scalar"}
+		}
 		effPhi.Add(&psiJI)
 	}
 

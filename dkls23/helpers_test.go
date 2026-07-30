@@ -52,8 +52,7 @@ func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
 		setups[id] = &SignerSetup{
 			MyID: id, AllIDs: allIDs, Share: share, PubKey: pk,
 			Threshold:  threshold,
-			VoleAlice:  make(map[int]*VOLEAliceState),
-			VoleBob:    make(map[int]*VOLEBobState),
+			BaseOT:     make(map[int]*BaseOTMaterial),
 			FZeroSeeds: make(map[int][16]byte),
 			Blacklist:  make(map[int]bool),
 		}
@@ -68,9 +67,12 @@ func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
 		}
 	}
 
+	type direction struct {
+		bobSeeds0, bobSeeds1, aliceSeeds [][]byte
+		sigma                            []bool
+	}
 	type pairResult struct {
-		aliceIJ, aliceJI *VOLEAliceState
-		bobIJ, bobJI     *VOLEBobState
+		ij, ji           direction
 		fzeroIJ, fzeroJI [16]byte
 		err              error
 	}
@@ -83,11 +85,11 @@ func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
 			defer wg.Done()
 			r := &results[idx]
 
-			r.aliceIJ, r.bobIJ, r.err = runVOLEPairwise()
+			r.ij.bobSeeds0, r.ij.bobSeeds1, r.ij.aliceSeeds, r.ij.sigma, r.err = runBaseOTOneDirection()
 			if r.err != nil {
 				return
 			}
-			r.aliceJI, r.bobJI, r.err = runVOLEPairwise()
+			r.ji.bobSeeds0, r.ji.bobSeeds1, r.ji.aliceSeeds, r.ji.sigma, r.err = runBaseOTOneDirection()
 			if r.err != nil {
 				return
 			}
@@ -121,10 +123,17 @@ func buildSetups(allIDs []int, threshold int) (map[int]*SignerSetup, error) {
 		if r.err != nil {
 			return nil, r.err
 		}
-		setups[p.i].VoleAlice[p.j] = r.aliceIJ
-		setups[p.j].VoleBob[p.i] = r.bobIJ
-		setups[p.j].VoleAlice[p.i] = r.aliceJI
-		setups[p.i].VoleBob[p.j] = r.bobJI
+		// i is VOLE Alice in direction i→j and VOLE Bob in direction j→i.
+		matI, err := NewBaseOTMaterial(r.ji.bobSeeds0, r.ji.bobSeeds1, r.ij.aliceSeeds, r.ij.sigma)
+		if err != nil {
+			return nil, err
+		}
+		matJ, err := NewBaseOTMaterial(r.ij.bobSeeds0, r.ij.bobSeeds1, r.ji.aliceSeeds, r.ji.sigma)
+		if err != nil {
+			return nil, err
+		}
+		setups[p.i].BaseOT[p.j] = matI
+		setups[p.j].BaseOT[p.i] = matJ
 		setups[p.i].FZeroSeeds[p.j] = r.fzeroIJ
 		setups[p.j].FZeroSeeds[p.i] = r.fzeroJI
 	}
@@ -268,7 +277,36 @@ func (f *failingEncryptor) Decrypt([]byte) ([]byte, error) {
 	return nil, errors.New("decrypt failed")
 }
 
-// runVOLEPairwise is a helper for tests: runs a full OTE+VOLE setup between Alice and Bob.
+// runBaseOTOneDirection runs one directed base OT and returns both halves: the
+// sender seed pairs the OTE receiver (VOLE Bob) needs, and the receiver seeds plus
+// choice bits the OTE sender (VOLE Alice) needs.
+func runBaseOTOneDirection() (bobSeeds0, bobSeeds1, aliceSeeds [][]byte, sigma []bool, err error) {
+	bobPrivKeys, bobPubKeys, err := BaseSenderRound1(LambdaC)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	sigmaBytes := make([]byte, (LambdaC+7)/8)
+	if _, err = rand.Read(sigmaBytes); err != nil {
+		return nil, nil, nil, nil, err
+	}
+	sigma = make([]bool, LambdaC)
+	for k := 0; k < LambdaC; k++ {
+		sigma[k] = (sigmaBytes[k/8]>>(uint(k)%8))&1 == 1
+	}
+	responses, aliceSeeds, err := BaseReceiverRound1(bobPubKeys, sigma)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	bobSeeds0, bobSeeds1, err = BaseSenderFinalize(bobPrivKeys, bobPubKeys, responses)
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+	return bobSeeds0, bobSeeds1, aliceSeeds, sigma, nil
+}
+
+// runVOLEPairwise is a helper for the VOLE unit tests: runs a full OTE+VOLE setup
+// between Alice and Bob. Note this produces a ONE-SHOT correlation — the signing
+// protocol derives its own per session and never stores one.
 // Returns (aliceState, bobState) ready for VOLEAliceMultiply / VOLEBobReceive.
 func runVOLEPairwise() (*VOLEAliceState, *VOLEBobState, error) {
 	// Bob plays base OT sender; Alice plays base OT receiver.
@@ -306,17 +344,17 @@ func runVOLEPairwise() (*VOLEAliceState, *VOLEBobState, error) {
 		beta[j] = (betaBytes[j/8]>>(uint(j)%8))&1 == 1
 	}
 
-	corrections, err := OTExtReceiverCorrections(bobSeeds0, bobSeeds1, beta)
+	corrections, correctionsProof, err := OTExtReceiverCorrections(testSID, bobSeeds0, bobSeeds1, beta)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	alpha0, alpha1, err := OTExtSenderExpand(aliceSeeds, sigma, corrections)
+	alpha0, alpha1, err := OTExtSenderExpand(testSID, aliceSeeds, sigma, corrections, correctionsProof)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	gamma, err := OTExtReceiverExpand(bobSeeds0, beta, corrections)
+	gamma, err := OTExtReceiverExpand(testSID, bobSeeds0, beta, corrections)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -333,3 +371,8 @@ func runVOLEPairwise() (*VOLEAliceState, *VOLEBobState, error) {
 
 	return aliceState, bobState, nil
 }
+
+// testSID stands in for a signing session's directed-pair id. Production derives
+// it from voleSIDForPair; tests that exercise the OT extension in isolation only
+// need both sides to agree on the same string.
+const testSID = "test-session:vole:1->2"

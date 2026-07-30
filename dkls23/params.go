@@ -51,6 +51,9 @@ const (
 	Ell = 2
 	// SaltLen is the byte length of FCom salts: 2*LambdaC/8 bytes.
 	SaltLen = 32
+	// baseOTSeedLen is the byte length of a base OT seed, as produced by
+	// shake256Seed in ot.go.
+	baseOTSeedLen = 32
 )
 
 // Domain separation tags for all hash/XOF calls in the protocol.
@@ -60,6 +63,7 @@ const (
 	domainOTEPRG       = "ote-prg"
 	domainOTESeed      = "ote-seed"
 	domainOTEExpand    = "ote-expand"
+	domainOTECheck     = "ote-check"
 	domainVOLEFS       = "vole-fs"
 	domainVOLEProof    = "vole-proof"
 	domainVOLERefresh  = "vole-refresh"

@@ -16,7 +16,6 @@ const valid32 = "000000000000000000000000000000000000000000000000000000000000000
 // valid16 is 32 hex chars (16 bytes) — valid for hexToFixed16.
 const valid16 = "00000000000000000000000000000001"
 
-
 func TestUnmarshalDKGRound1OutputErrors(t *testing.T) {
 	cases := []struct {
 		name string
