@@ -59,8 +59,19 @@ func (a gf128) equal(b gf128) bool { return a.hi == b.hi && a.lo == b.lo }
 // product as (hi, lo).
 //
 // Written as shift-and-XOR rather than with CPU carry-less multiply
-// instructions, because the alternative is assembly per architecture and this is
-// not on a hot path: the check runs once per VOLE instance, over Xi elements.
+// instructions (PMULL on arm64, PCLMULQDQ on amd64), because the alternative is
+// assembly per architecture.
+//
+// That is a real cost and should be read as a debt, not as a free choice. An
+// earlier version of this comment said the check "is not on a hot path: the
+// check runs once per VOLE instance". That was wrong. The OT extension, and with
+// it this check, is re-derived once per SIGNING SESSION per directed pair — see
+// freshBobForSession in sign.go and prg in ot_extension.go for why it has to be.
+// One pass folds Xi = 416 field elements and each mul is four clmul64 calls of
+// 64 iterations apiece, so a single 2-of-3 signature spins this loop on the
+// order of a million times, and it is visible in a CPU profile of the ceremony.
+// Replacing it with intrinsics is worth doing; the correctness bar is that the
+// differential tests against the math/big reference in gf128_test.go still pass.
 //
 // It is NOT constant time with respect to b — the branch is on b's bits. That is
 // deliberate and sound here: every value multiplied in this check is either

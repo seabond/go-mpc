@@ -64,22 +64,7 @@ func boolsToBitVec(beta [Xi]bool) [Xi / 8]byte {
 	return out
 }
 
-// getBit returns the bit at position j in a packed byte array (LSB-first).
-func getBit(v [Xi / 8]byte, j int) bool {
-	return (v[j/8]>>(uint(j)%8))&1 == 1
-}
-
-// getColumnLambdaC extracts column j of an LambdaC x Xi matrix stored as rows T[k] ∈ {0,1}^Xi.
-// Returns LambdaC bits as a packed byte array (LambdaC/8 = 16 bytes).
-func getColumnLambdaC(rows [][Xi / 8]byte, j int) []byte {
-	out := make([]byte, LambdaC/8)
-	for k := 0; k < LambdaC; k++ {
-		if getBit(rows[k], j) {
-			out[k/8] |= 1 << (uint(k) % 8)
-		}
-	}
-	return out
-}
+// Column reads of the LambdaC x Xi matrix live in bitmatrix.go.
 
 // oteSeedHash computes SHAKE256("ote-seed" || choice_byte || j_bytes || col_bytes) → 32 bytes.
 // The choice bit is written branchlessly.
@@ -209,9 +194,13 @@ func OTExtSenderExpand(sid string, aliceSeeds [][]byte, sigma []bool, correction
 	alpha0 = make([][Ell + Rho][32]byte, Xi)
 	alpha1 = make([][Ell + Rho][32]byte, Xi)
 
+	// All Xi columns of Q in one pass; qCols[j] is column j. See bitmatrix.go.
+	qCols := transposeLambdaCxXi(Q)
+	defer zeroTransposed(qCols)
+
 	for j := 0; j < Xi; j++ {
 		// q^j = column j of Q matrix ∈ {0,1}^LambdaC
-		qj := getColumnLambdaC(Q, j)
+		qj := qCols[j][:]
 
 		// q^j XOR sigma_vec
 		qjXorSigma := make([]byte, LambdaC/8)
@@ -249,9 +238,13 @@ func OTExtReceiverExpand(sid string, bobSeeds0 [][]byte, beta [Xi]bool, correcti
 		T[k] = prg(sid, bobSeeds0[k])
 	}
 
+	// All Xi columns of T in one pass; tCols[j] is column j. See bitmatrix.go.
+	tCols := transposeLambdaCxXi(T)
+	defer zeroTransposed(tCols)
+
 	gamma = make([][Ell + Rho][32]byte, Xi)
 	for j := 0; j < Xi; j++ {
-		tj := getColumnLambdaC(T, j)
+		tj := tCols[j][:]
 		bobSeedJ := oteSeedHash(sid, beta[j], j, tj)
 		for i := 0; i < Ell+Rho; i++ {
 			gamma[j][i] = oteExpandHash(sid, beta[j], j, i, bobSeedJ)

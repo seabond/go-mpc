@@ -125,6 +125,90 @@ func BenchmarkSign3of3(b *testing.B) {
 	}
 }
 
+// BenchmarkSign2of3 times one complete 2-of-3 signing ceremony in-process:
+// three rounds plus the combine, with both signers driven on this goroutine.
+// The DKG and the pairwise VOLE/FZero setup are excluded — they happen once per
+// wallet, not once per signature.
+//
+// This is the number to watch for signing latency. It is the whole ceremony, so
+// it includes both directed VOLE instances and therefore all four column-major
+// reads of an OT-extension matrix.
+func BenchmarkSign2of3(b *testing.B) {
+	b.StopTimer()
+	setups := setupSigners(b, []int{1, 2, 3}, 2)
+	message := []byte("benchmark message")
+	signers := []int{1, 2}
+	b.StartTimer()
+
+	for i := 0; i < b.N; i++ {
+		sigID := fmt.Sprintf("bench-2of3-sig-%d", i)
+
+		// Round 1.
+		round1States := make(map[int]*Round1State)
+		round1Msgs := make(map[int]map[int]*Round1Msg)
+		for _, id := range signers {
+			st, msgs, err := SignRound1(setups[id], sigID, signers)
+			if err != nil {
+				b.Fatal(err)
+			}
+			round1States[id] = st
+			round1Msgs[id] = msgs
+		}
+
+		// Round 2.
+		round2States := make(map[int]*Round2State)
+		round2Msgs := make(map[int]map[int]*Round2Msg)
+		for _, id := range signers {
+			inbound := map[int]*Round1Msg{}
+			for _, j := range signers {
+				if j != id {
+					inbound[j] = round1Msgs[j][id]
+				}
+			}
+			st, msgs, err := SignRound2(setups[id], round1States[id], inbound)
+			if err != nil {
+				b.Fatal(err)
+			}
+			round2States[id] = st
+			round2Msgs[id] = msgs
+		}
+
+		// Round 3.
+		round3Frags := make(map[int]map[int]*Round3Msg)
+		for _, id := range signers {
+			inbound := map[int]*Round2Msg{}
+			for _, j := range signers {
+				if j != id {
+					inbound[j] = round2Msgs[j][id]
+				}
+			}
+			frags, err := SignRound3(setups[id], round2States[id], message, inbound)
+			if err != nil {
+				b.Fatal(err)
+			}
+			round3Frags[id] = frags
+		}
+
+		// Combine.
+		combiner := signers[0]
+		myFrag := round3Frags[combiner][combiner]
+		var myW, myU btcec.ModNScalar
+		myW.SetByteSlice(myFrag.W_i)
+		myU.SetByteSlice(myFrag.U_i)
+		rx := computeRxFromStates(signers, round2States)
+		allRound3 := make(map[int]*Round3Msg)
+		for _, j := range signers {
+			if j != combiner {
+				allRound3[j] = round3Frags[j][combiner]
+			}
+		}
+		_, _, err := SignCombine(setups[combiner], &rx, &myW, &myU, allRound3, message)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkVOLESetup(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
