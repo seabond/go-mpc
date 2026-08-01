@@ -30,10 +30,10 @@ import (
 // protocol restructure, not a check.
 //
 // So it is the CALLER's obligation, and a caller holding real funds must meet it
-// durably. The vault does: badgerClient.claimSigID records every sig id per
-// wallet inside the write transaction that uses it, permanently, with badger's
-// conflict detection making two concurrent claims impossible. This test is why
-// that guard exists and why its record never expires.
+// durably: record every sig id, per setup, inside the same durable write
+// transaction that consumes it, permanently, with conflict detection that makes
+// two concurrent claims impossible. This test is why such a guard has to exist
+// and why its record must never expire.
 //
 // If someone later makes reuse safe, this test fails — and the right response is
 // to delete it and the guard together, not to weaken either alone.
@@ -124,8 +124,8 @@ func TestReusingASigIDLeaksTheNonceDifference(t *testing.T) {
 		t.Fatalf("expected reuse of sigID %q to leak the nonce difference at all %d "+
 			"agreeing indices, got %d. If the pads no longer repeat under one sigID, "+
 			"the caller obligation this documents has been lifted — check what changed "+
-			"and retire claimSigID with it rather than leaving a guard whose reason has "+
-			"gone", sigID, agreeing, leaked)
+			"and retire the caller-side sigID guard with it rather than leaving a guard "+
+			"whose reason has gone", sigID, agreeing, leaked)
 	}
 	t.Logf("reusing one sigID leaked the nonce difference at %d of %d agreeing indices; "+
 		"this is why sig ids are claimed durably and never expire", leaked, agreeing)
