@@ -98,9 +98,13 @@ func oteProve(sid string, T [][Xi / 8]byte, beta [Xi]bool, corrections [][Xi / 8
 	}
 	chi := oteChallenge(sid, corrections)
 
+	// All Xi columns of T in one pass; tCols[j] is column j. See bitmatrix.go.
+	tCols := transposeLambdaCxXi(T)
+	defer zeroTransposed(tCols)
+
 	var tTilde, xTilde gf128
 	for j := range Xi {
-		tj := gf128FromBytes(getColumnLambdaC(T, j))
+		tj := gf128FromBytes(tCols[j][:])
 		tTilde = tTilde.add(tj.mul(chi[j]))
 		if beta[j] {
 			xTilde = xTilde.add(chi[j])
@@ -120,9 +124,13 @@ func oteVerify(sid string, Q [][Xi / 8]byte, sigma []bool, corrections [][Xi / 8
 	}
 	chi := oteChallenge(sid, corrections)
 
+	// All Xi columns of Q in one pass; qCols[j] is column j. See bitmatrix.go.
+	qCols := transposeLambdaCxXi(Q)
+	defer zeroTransposed(qCols)
+
 	var lhs gf128
 	for j := range Xi {
-		qj := gf128FromBytes(getColumnLambdaC(Q, j))
+		qj := gf128FromBytes(qCols[j][:])
 		lhs = lhs.add(qj.mul(chi[j]))
 	}
 

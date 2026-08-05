@@ -297,8 +297,8 @@ func checkBlacklist(setup *SignerSetup, partyIDs []int, phase string) error {
 // That is a protocol restructure, not a check.
 //
 // A caller holding real funds should record every sigID it has used, per setup,
-// permanently, in the same transaction that consumes it. See the vault's
-// claimSigID for one that does.
+// permanently, in the same durable transaction that consumes it, with conflict
+// detection so that two concurrent claims cannot both succeed.
 func SignRound1(setup *SignerSetup, sigID string, signers []int) (state *Round1State, msgs map[int]*Round1Msg, err error) {
 	secretdo.Do(func() {
 		state, msgs, err = signRound1(setup, sigID, signers)
