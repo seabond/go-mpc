@@ -3,7 +3,6 @@ package dkls23
 import (
 	"encoding/binary"
 	"errors"
-	"math/big"
 
 	"golang.org/x/crypto/sha3"
 )
@@ -66,45 +65,101 @@ func boolsToBitVec(beta [Xi]bool) [Xi / 8]byte {
 
 // Column reads of the LambdaC x Xi matrix live in bitmatrix.go.
 
-// oteSeedHash computes SHAKE256("ote-seed" || choice_byte || j_bytes || col_bytes) → 32 bytes.
+// oteHasher is one SHAKE256 state and the scratch it absorbs through, reused
+// across an expansion's thousands of hashes.
+//
+// It exists for a measured reason, not for tidiness. Each expansion makes
+// Xi = 416 seed hashes and Xi*(Ell+Rho) = 1 664 expand hashes, and the
+// straightforward form — a fresh state per call, a `[]byte(domain)` conversion
+// per call, a `[]byte{0x00}` per call, a heap `raw` per call — allocated roughly
+// eight objects on each one. That was the bulk of everything SignRound1
+// allocated, and on a build with runtime/secret erasure active the sweep at the
+// end of every Do is proportional to exactly that.
+//
+// The digest is UNCHANGED. A hash absorbs a byte stream, so one Write of
+// domain‖sid‖0x00‖choice‖j[‖i]‖tail is the same input as the six Writes it
+// replaced; TestOTEHasherMatchesTheHashesItReplaced pins that against the
+// original form.
+//
+// It is not safe for concurrent use, and must not be: two goroutines sharing one
+// would interleave their absorbs and produce pads neither party can reproduce.
+// Each expansion builds its own.
+type oteHasher struct {
+	h sha3.ShakeHash
+	// buf holds domain‖sid‖0x00 in its first pre bytes, then whatever this call
+	// appends. Kept at full capacity between calls so the append never reallocates.
+	buf []byte
+	pre int
+	// raw is the XOF output, a field rather than a local so that handing it to
+	// h.Read — an interface method, which escape analysis cannot see into — does
+	// not allocate on every call.
+	raw [64]byte
+}
+
+func newOTEHasher(domain, sid string, tail int) *oteHasher {
+	buf := make([]byte, 0, len(domain)+len(sid)+1+1+8+8+tail)
+	buf = append(buf, domain...)
+	buf = append(buf, sid...)
+	buf = append(buf, 0x00) // separator: sid and what follows cannot run together
+	return &oteHasher{h: sha3.NewShake256(), buf: buf, pre: len(buf)}
+}
+
+// zero erases the scratch this hasher accumulated. Callers defer it, the way
+// they already defer zeroTransposed on the matrix that feeds it.
+//
+// It is needed because the scratch is a verbatim copy of material this package
+// erases elsewhere: after a seedHash, buf's tail holds the transposed T/Q column
+// that zeroTransposed exists to wipe, and after an expandHash it holds the
+// derived OTE seed while raw holds the 64-byte pre-reduction pad. zeroize.go's
+// own header says dropping the reference was never erasure, so the reused
+// buffer that made this hasher fast must be wiped the way a per-call buffer's
+// garbage would not have to be.
+//
+// buf is wiped to its full capacity, not its length: seedHash and expandHash
+// leave it re-sliced to whatever the last call appended, and the bytes past that
+// length are the previous call's column.
+func (o *oteHasher) zero() {
+	zeroBytes(o.buf[:cap(o.buf)])
+	zeroBytes(o.raw[:])
+}
+
+// absorb resets the state and feeds it the constant prefix plus this call's
+// suffix, leaving the buffer ready for the next one.
+func (o *oteHasher) absorb(suffix []byte) {
+	o.h.Reset()
+	o.h.Write(suffix)
+}
+
+// seedHash computes SHAKE256("ote-seed" || choice_byte || j_bytes || col_bytes) → 32 bytes.
 // The choice bit is written branchlessly.
-func oteSeedHash(sid string, choice bool, j int, col []byte) []byte {
-	h := sha3.NewShake256()
-	h.Write([]byte(domainOTESeed))
-	h.Write([]byte(sid))
-	h.Write([]byte{0x00})
-	h.Write([]byte{byte(condUint32(choice))})
-	var jbuf [8]byte
-	binary.BigEndian.PutUint64(jbuf[:], uint64(j))
-	h.Write(jbuf[:])
-	h.Write(col)
-	out := make([]byte, 32)
-	h.Read(out)
+func (o *oteHasher) seedHash(choice bool, j int, col []byte) [32]byte {
+	b := append(o.buf[:o.pre], byte(condUint32(choice)))
+	b = binary.BigEndian.AppendUint64(b, uint64(j))
+	b = append(b, col...)
+	o.buf = b
+	o.absorb(b)
+	var out [32]byte
+	o.h.Read(o.raw[:32])
+	copy(out[:], o.raw[:32])
 	return out
 }
 
-// oteExpandHash computes SHAKE256("ote-expand" || choice_byte || j || i || seed) mod q → stored in 32 bytes.
+// expandHash computes SHAKE256("ote-expand" || choice_byte || j || i || seed) mod q → 32 bytes.
 // The choice bit is written branchlessly.
-func oteExpandHash(sid string, choice bool, j, i int, seed []byte) [32]byte {
-	h := sha3.NewShake256()
-	h.Write([]byte(domainOTEExpand))
-	h.Write([]byte(sid))
-	h.Write([]byte{0x00})
-	h.Write([]byte{byte(condUint32(choice))})
-	var jbuf [8]byte
-	binary.BigEndian.PutUint64(jbuf[:], uint64(j))
-	h.Write(jbuf[:])
-	binary.BigEndian.PutUint64(jbuf[:], uint64(i))
-	h.Write(jbuf[:])
-	h.Write(seed)
-
-	raw := make([]byte, 64)
-	h.Read(raw)
-	v := new(big.Int).SetBytes(raw)
-	v.Mod(v, curveOrder)
-	var out [32]byte
-	v.FillBytes(out[:])
-	return out
+//
+// The reduction is reduce64Scalar, not math/big: the same value, and where this
+// function's remaining cost was — `big.nat.make` under it was 52 % of every byte
+// SignRound1 allocated.
+func (o *oteHasher) expandHash(choice bool, j, i int, seed []byte) [32]byte {
+	b := append(o.buf[:o.pre], byte(condUint32(choice)))
+	b = binary.BigEndian.AppendUint64(b, uint64(j))
+	b = binary.BigEndian.AppendUint64(b, uint64(i))
+	b = append(b, seed...)
+	o.buf = b
+	o.absorb(b)
+	o.h.Read(o.raw[:])
+	s := reduce64Scalar(&o.raw)
+	return s.Bytes()
 }
 
 // OTExtReceiverCorrections computes Bob's correction vectors for IKNP OT extension.
@@ -198,22 +253,29 @@ func OTExtSenderExpand(sid string, aliceSeeds [][]byte, sigma []bool, correction
 	qCols := transposeLambdaCxXi(Q)
 	defer zeroTransposed(qCols)
 
+	// Two reused SHAKE256 states for every hash this loop makes; see oteHasher.
+	// Their scratch holds copies of the same column material qCols does, so it is
+	// erased on the same terms.
+	sh := newOTEHasher(domainOTESeed, sid, LambdaC/8)
+	eh := newOTEHasher(domainOTEExpand, sid, 32)
+	defer sh.zero()
+	defer eh.zero()
 	for j := 0; j < Xi; j++ {
 		// q^j = column j of Q matrix ∈ {0,1}^LambdaC
 		qj := qCols[j][:]
 
 		// q^j XOR sigma_vec
-		qjXorSigma := make([]byte, LambdaC/8)
+		var qjXorSigma [LambdaC / 8]byte
 		for b := range qjXorSigma {
 			qjXorSigma[b] = qj[b] ^ sigmaColBytes[b]
 		}
 
-		seed0j := oteSeedHash(sid, false, j, qj)
-		seed1j := oteSeedHash(sid, true, j, qjXorSigma)
+		seed0j := sh.seedHash(false, j, qj)
+		seed1j := sh.seedHash(true, j, qjXorSigma[:])
 
 		for i := 0; i < Ell+Rho; i++ {
-			alpha0[j][i] = oteExpandHash(sid, false, j, i, seed0j)
-			alpha1[j][i] = oteExpandHash(sid, true, j, i, seed1j)
+			alpha0[j][i] = eh.expandHash(false, j, i, seed0j[:])
+			alpha1[j][i] = eh.expandHash(true, j, i, seed1j[:])
 		}
 	}
 	return
@@ -243,11 +305,18 @@ func OTExtReceiverExpand(sid string, bobSeeds0 [][]byte, beta [Xi]bool, correcti
 	defer zeroTransposed(tCols)
 
 	gamma = make([][Ell + Rho][32]byte, Xi)
+	// Two reused SHAKE256 states for every hash this loop makes; see oteHasher.
+	// Their scratch holds copies of the same column material tCols does, so it is
+	// erased on the same terms.
+	sh := newOTEHasher(domainOTESeed, sid, LambdaC/8)
+	eh := newOTEHasher(domainOTEExpand, sid, 32)
+	defer sh.zero()
+	defer eh.zero()
 	for j := 0; j < Xi; j++ {
 		tj := tCols[j][:]
-		bobSeedJ := oteSeedHash(sid, beta[j], j, tj)
+		bobSeedJ := sh.seedHash(beta[j], j, tj)
 		for i := 0; i < Ell+Rho; i++ {
-			gamma[j][i] = oteExpandHash(sid, beta[j], j, i, bobSeedJ)
+			gamma[j][i] = eh.expandHash(beta[j], j, i, bobSeedJ[:])
 		}
 	}
 	return
