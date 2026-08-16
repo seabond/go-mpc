@@ -110,8 +110,25 @@ func GadgetInnerProduct(beta [Xi]bool) btcec.ModNScalar {
 }
 
 // condUint32 returns 1 if b is true, 0 otherwise.
-// On Go 1.20+ this compiles to a branchless conditional-move instruction
-// (CSEL on ARM64, CMOV on x86-64).
+//
+// The bit it converts is secret on the receiver's side: beta is Bob's OTE
+// choice vector, and it reaches here at the gadget mask above and at both
+// hashes in OTExtReceiverExpand. A data-dependent branch would leak a bit of
+// that vector per call.
+//
+// Go has no branchless spelling of bool -> uint32 without unsafe, so the
+// property comes from the compiler, not from the source: a Go bool is
+// canonically 0 or 1, so the `if` is elided entirely and this compiles to a
+// zero-extending byte move. Verified in the emitted assembly, go1.26:
+//
+//	arm64   MOVBU   R0, R0
+//	amd64   MOVBLZX AL, AX
+//
+// Neither is a conditional move. An earlier version of this comment claimed
+// CSEL/CMOV, which was a guess, and named instructions that are not emitted —
+// the generated code is better than the claim, but the claim was still wrong.
+// If you touch this function, read `go build -gcflags=-S` again rather than
+// assuming: the language does not promise this, the compiler merely does it.
 func condUint32(b bool) uint32 {
 	var v uint32
 	if b {

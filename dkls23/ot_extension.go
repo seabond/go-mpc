@@ -131,7 +131,8 @@ func (o *oteHasher) absorb(suffix []byte) {
 }
 
 // seedHash computes SHAKE256("ote-seed" || choice_byte || j_bytes || col_bytes) → 32 bytes.
-// The choice bit is written branchlessly.
+// choice goes through condUint32, which compiles to a byte move rather than a
+// branch — see its comment, because on the receiver's side that bit is secret.
 func (o *oteHasher) seedHash(choice bool, j int, col []byte) [32]byte {
 	b := append(o.buf[:o.pre], byte(condUint32(choice)))
 	b = binary.BigEndian.AppendUint64(b, uint64(j))
@@ -145,7 +146,8 @@ func (o *oteHasher) seedHash(choice bool, j int, col []byte) [32]byte {
 }
 
 // expandHash computes SHAKE256("ote-expand" || choice_byte || j || i || seed) mod q → 32 bytes.
-// The choice bit is written branchlessly.
+// choice goes through condUint32, which compiles to a byte move rather than a
+// branch — see its comment, because on the receiver's side that bit is secret.
 //
 // The reduction is reduce64Scalar, not math/big: the same value, and where this
 // function's remaining cost was — `big.nat.make` under it was 52 % of every byte
