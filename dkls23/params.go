@@ -110,8 +110,25 @@ func GadgetInnerProduct(beta [Xi]bool) btcec.ModNScalar {
 }
 
 // condUint32 returns 1 if b is true, 0 otherwise.
-// On Go 1.20+ this compiles to a branchless conditional-move instruction
-// (CSEL on ARM64, CMOV on x86-64).
+//
+// The bit it converts is secret on the receiver's side: beta is Bob's OTE
+// choice vector, and it reaches here at the gadget mask above and at both
+// hashes in OTExtReceiverExpand. A data-dependent branch would leak a bit of
+// that vector per call.
+//
+// Go has no branchless spelling of bool -> uint32 without unsafe, so the
+// property comes from the compiler, not from the source: a Go bool is
+// canonically 0 or 1, so the `if` is elided entirely and this compiles to a
+// zero-extending byte move. Verified in the emitted assembly, go1.26:
+//
+//	arm64   MOVBU   R0, R0
+//	amd64   MOVBLZX AL, AX
+//
+// Neither is a conditional move. An earlier version of this comment claimed
+// CSEL/CMOV, which was a guess, and named instructions that are not emitted —
+// the generated code is better than the claim, but the claim was still wrong.
+// If you touch this function, read `go build -gcflags=-S` again rather than
+// assuming: the language does not promise this, the compiler merely does it.
 func condUint32(b bool) uint32 {
 	var v uint32
 	if b {
@@ -164,4 +181,41 @@ func reduce64Public(b []byte) btcec.ModNScalar {
 	var s btcec.ModNScalar
 	s.SetBytes(&buf)
 	return s
+}
+
+// twoTo256ModQ is 2^256 mod q: the weight the high half of a 512-bit value
+// carries once it is folded into the group.
+var twoTo256ModQ = func() btcec.ModNScalar {
+	v := new(big.Int).Mod(new(big.Int).Lsh(big.NewInt(1), 256), curveOrder)
+	var buf [32]byte
+	v.FillBytes(buf[:])
+	var s btcec.ModNScalar
+	s.SetBytes(&buf)
+	return s
+}()
+
+// reduce64Scalar is reduce64Public without math/big: it splits the 64 bytes into
+// two 256-bit halves, reduces each with ModNScalar.SetBytes, and recombines them
+// as hi*2^256 + lo. That is an identity, not an approximation — (hi mod q) *
+// (2^256 mod q) + (lo mod q) ≡ hi*2^256 + lo (mod q) — and
+// TestReduce64ScalarMatchesBigInt pins it against the big.Int form over random
+// inputs.
+//
+// It exists because oteExpandHash calls this Xi*(Ell+Rho) = 1 664 times per OT
+// extension and the big.Int form allocated on every one: `math/big.nat.make`
+// under it was 52 % of every byte SignRound1 allocated. The package already
+// replaced btcec's big.Int inverse for the same reason; see scalarInverse.
+//
+// Like reduce64Public it is not constant time in the sense that btcec's own
+// SetBytes is not, and it is used on the same kind of value: an OT-extension pad
+// derived from a hash, where the reduction's timing carries no secret the
+// counterparty does not already hold. It must NOT be reached for a long-lived
+// key.
+func reduce64Scalar(b *[64]byte) btcec.ModNScalar {
+	var hi, lo btcec.ModNScalar
+	hi.SetBytes((*[32]byte)(b[0:32]))
+	lo.SetBytes((*[32]byte)(b[32:64]))
+	hi.Mul(&twoTo256ModQ)
+	hi.Add(&lo)
+	return hi
 }
